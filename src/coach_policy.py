@@ -6,7 +6,7 @@ import asyncio
 import re
 
 # Constants
-CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
+CLAUDE_MODEL = "claude-sonnet-4-5"
 API_TIMEOUT_SECONDS = 30
 DECIDE_TIMEOUT_SECONDS = 10
 LOW_ARGUMENT_THRESHOLD = 0.1
@@ -151,7 +151,8 @@ class CoachPolicyAgent:
                     return self._avoid_repetition(preferred, context)
         
         # Rule 2: Check for off-topic or empty input
-        argument_score = getattr(analysis, 'argument_score', 0.0) if hasattr(analysis, 'argument_score') else 0.0
+        argument = getattr(analysis, 'argument', None)
+        argument_score = getattr(argument, 'argument_score', 0.0) if argument is not None else 0.0
         if argument_score < LOW_ARGUMENT_THRESHOLD:
             preferred = CoachingStrategy.REDIRECT
             return self._avoid_repetition(preferred, context)
@@ -169,16 +170,14 @@ class CoachPolicyAgent:
             return result
         
         # Rule 6: Has claim but no reasoning
-        if hasattr(analysis, 'has_claim') and hasattr(analysis, 'has_reasoning'):
-            if analysis.has_claim and not analysis.has_reasoning:
-                preferred = CoachingStrategy.PROBE
-                return self._avoid_repetition(preferred, context)
+        if argument is not None:
+            if getattr(argument, 'has_claim', False) and not getattr(argument, 'has_reasoning', False):
+                return self._avoid_repetition(CoachingStrategy.PROBE, context)
         
         # Rule 7: Has reasoning but no evidence
-        if hasattr(analysis, 'has_reasoning') and hasattr(analysis, 'has_evidence'):
-            if analysis.has_reasoning and not analysis.has_evidence:
-                preferred = CoachingStrategy.PROBE
-                return self._avoid_repetition(preferred, context)
+        if argument is not None:
+            if getattr(argument, 'has_reasoning', False) and not getattr(argument, 'has_evidence', False):
+                return self._avoid_repetition(CoachingStrategy.PROBE, context)
         
         # Rule 8: Default
         preferred = CoachingStrategy.PROBE
@@ -413,4 +412,11 @@ Respond in 1-3 sentences. Be conversational and natural. No bullet points or mar
         Returns:
             Appropriate fallback response text
         """
-        fallback_responses =
+        fallback_responses = {
+            CoachingStrategy.PROBE: f"What's your main argument about {context.topic}?",
+            CoachingStrategy.CHALLENGE: f"That's an interesting point — but what would someone who disagrees say?",
+            CoachingStrategy.REDIRECT: f"Let's refocus — what's your position on {context.topic}?",
+            CoachingStrategy.PRAISE_AND_PUSH: f"You're making progress. Can you back that up with a specific example?",
+            CoachingStrategy.CORRECT_PRONUNCIATION: f"Could you say that again? I want to make sure I understood you.",
+        }
+        return fallback_responses.get(strategy, f"What do you think about {context.topic}?")

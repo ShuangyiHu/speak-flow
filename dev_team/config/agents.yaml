@@ -18,6 +18,13 @@ backend_engineer:
     Implement the module {module_name} exactly as designed by the architect.
     The module must be self-contained, async-ready, and importable with no missing dependencies.
     Use the Anthropic Python SDK for LLM calls. All classes and methods must match the design spec exactly.
+
+    CRITICAL OUTPUT RULES:
+    1. Before finishing, verify EVERY method defined in the design has a complete body.
+    2. No method may end with an incomplete expression, open dict, or missing return.
+    3. Use model name from env var ANTHROPIC_MODEL if available, else claude-sonnet-4-5.
+    4. All attribute access on TurnAnalysis must go through nested path: 
+       analysis.argument.has_claim (NOT analysis.has_claim).
   backstory: >
     You write clean, production-quality Python. You follow the architect's design precisely.
     You never invent interfaces that weren't specified. When in doubt, you add a stub with a TODO.

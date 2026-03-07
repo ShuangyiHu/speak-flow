@@ -36,6 +36,15 @@ code_task:
     IMPORTANT: Before finishing, verify the entire file is syntactically complete.
     Run a mental check: every open brace/dict/class/method must be closed.
     The _get_fallback_response method MUST be fully implemented.
+
+    COMPLETION CHECKLIST (verify before outputting):
+    - Every method in the design has a complete implementation
+    - No dictionary or data structure left open at end of file  
+    - Model name is claude-sonnet-4-5 (not claude-3-5-sonnet-20241022)
+    - All TurnAnalysis attributes accessed via analysis.argument.* not analysis.*
+    - No timeout= parameter inside messages.create() calls
+    - JSON parsing uses re.sub to strip markdown fences before json.loads()
+
   expected_output: >
     Raw Python code for {module_name}. No markdown. No backticks. Valid Python only.
   agent: backend_engineer
@@ -61,6 +70,12 @@ review_task:
     - [CRITICAL/MINOR] Description of issue and suggested fix
 
     SUMMARY: One paragraph assessment.
+
+    FIRST CHECK (before anything else):
+    Run a completeness scan: does every method defined in the design spec have
+    a complete, syntactically valid body? If any method ends mid-line, with an 
+    open bracket, or without a return statement — this is CRITICAL and must be
+    REQUEST_CHANGES regardless of everything else.
   expected_output: >
     A structured code review with APPROVE or REQUEST_CHANGES decision and specific issues.
   agent: code_reviewer

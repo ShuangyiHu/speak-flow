@@ -14,6 +14,8 @@ Environment variables:
 
 import os
 import re
+import py_compile
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -29,11 +31,12 @@ class GitHubPRManager:
     Full PR lifecycle using GitHub API only.
     Never touches local git — no checkout, no stash, no push.
 
-    1. Create feature branch from default branch (API)
-    2. Upload generated files to the branch (API)
-    3. Open a Pull Request with reviewer report as description (API)
-    4. Post reviewer agent output as a formal PR review (API)
-    5. Auto-merge if reviewer decision is APPROVE (API)
+    1. Syntax-check all Python files before doing anything (abort if broken)
+    2. Create feature branch from default branch (API)
+    3. Upload generated files to the branch (API)
+    4. Open a Pull Request with reviewer report as description (API)
+    5. Post reviewer agent output as a formal PR review (API)
+    6. Auto-merge if reviewer decision is APPROVE (API)
     """
 
     def __init__(self, token: str, repo: str):
@@ -43,7 +46,18 @@ class GitHubPRManager:
         self.gh_repo = self.gh.get_repo(repo)
 
     def create_pr_from_output(self, module_name: str, output_dir: Path, review_text: str):
-        """Full pipeline: branch → upload files → PR → review → maybe merge."""
+        """Full pipeline: syntax check → branch → upload files → PR → review → maybe merge."""
+
+        # ── Step 0: Syntax check all Python files before touching GitHub ──────
+        print(f"\n[GitHub] Running syntax check on output files...")
+        syntax_errors = self._syntax_check(module_name, output_dir)
+        if syntax_errors:
+            print("[GitHub] ABORTING — syntax errors found. Fix before creating PR:")
+            for err in syntax_errors:
+                print(f"  ✗ {err}")
+            return None
+        print("[GitHub] Syntax check passed.")
+
         stem = module_name.replace(".py", "")
         branch_name = self._branch_name(stem)
         base_branch = self.gh_repo.default_branch
@@ -82,6 +96,32 @@ class GitHubPRManager:
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
+    def _syntax_check(self, module_name: str, output_dir: Path) -> list[str]:
+        """
+        Compile-check all Python output files.
+        Returns list of error strings; empty list means all passed.
+        """
+        errors = []
+        python_files = [
+            output_dir / module_name,
+            output_dir / f"test_{module_name}",
+            output_dir / "app.py",
+        ]
+        for path in python_files:
+            if not path.exists():
+                continue
+            try:
+                # Write to a temp file so py_compile doesn't pollute output dir with .pyc
+                with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as tmp:
+                    tmp.write(path.read_text(encoding="utf-8"))
+                    tmp_path = tmp.name
+                py_compile.compile(tmp_path, doraise=True)
+                Path(tmp_path).unlink(missing_ok=True)
+            except py_compile.PyCompileError as e:
+                errors.append(f"{path.name}: {e}")
+                Path(tmp_path).unlink(missing_ok=True)
+        return errors
+
     def _branch_name(self, stem: str) -> str:
         ts = datetime.now().strftime("%Y%m%d-%H%M")
         return f"feat/{stem.replace('_', '-')}-{ts}"
@@ -94,11 +134,11 @@ class GitHubPRManager:
         """Upload each generated file to its destination path in the repo via API."""
         uploaded = []
         mappings = {
-            output_dir / module_name:                   f"src/{module_name}",
-            output_dir / f"test_{module_name}":         f"tests/test_{module_name}",
-            output_dir / "app.py":                      "app/app.py",
-            output_dir / f"{module_name}_design.md":    f"docs/{stem}_design.md",
-            output_dir / f"{module_name}_review.md":    f"docs/{stem}_review.md",
+            output_dir / module_name:                f"src/{module_name}",
+            output_dir / f"test_{module_name}":      f"tests/test_{module_name}",
+            output_dir / "app.py":                   "app/app.py",
+            output_dir / f"{module_name}_design.md": f"docs/{stem}_design.md",
+            output_dir / f"{module_name}_review.md": f"docs/{stem}_review.md",
         }
 
         for local_path, repo_path in mappings.items():

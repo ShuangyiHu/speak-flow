@@ -32,6 +32,10 @@ code_task:
     - Use asyncio for concurrent LLM + MFA calls
     - Add a stub MFA implementation that can be toggled with USE_STUB_MFA=True env var
     - Include docstrings on all public methods
+
+    IMPORTANT: Before finishing, verify the entire file is syntactically complete.
+    Run a mental check: every open brace/dict/class/method must be closed.
+    The _get_fallback_response method MUST be fully implemented.
   expected_output: >
     Raw Python code for {module_name}. No markdown. No backticks. Valid Python only.
   agent: backend_engineer

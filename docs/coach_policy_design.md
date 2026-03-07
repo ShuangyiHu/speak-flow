@@ -1,20 +1,27 @@
-# CoachPolicyAgent Technical Design
+# Technical Design: coach_policy.py
 
-## Module Dependencies
+## Overview
+
+This module implements the CoachPolicyAgent for SpeakFlow AI's debate coaching platform. It receives TurnAnalysis objects and decides coaching actions using rule-based strategy selection and Claude AI for response generation.
+
+## External Dependencies
 
 ```python
+from anthropic import AsyncAnthropic
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional
 import asyncio
 import re
-from enum import Enum
-from dataclasses import dataclass
-from typing import List, Optional
-from anthropic import AsyncAnthropic
 ```
 
 ## Data Models
 
 ### CoachingStrategy Enum
+
 ```python
+from enum import Enum
+
 class CoachingStrategy(Enum):
     PROBE = "probe"
     CHALLENGE = "challenge"
@@ -24,17 +31,19 @@ class CoachingStrategy(Enum):
 ```
 
 ### CoachingAction Dataclass
+
 ```python
 @dataclass
 class CoachingAction:
     strategy: CoachingStrategy
     response_text: str
     internal_reason: str
-    target_word: str = ""
-    difficulty_delta: int = 0
+    target_word: str
+    difficulty_delta: int
 ```
 
 ### SessionContext Dataclass
+
 ```python
 @dataclass
 class SessionContext:
@@ -46,314 +55,235 @@ class SessionContext:
     argument_scores: List[float]
 ```
 
+## Constants
+
+```python
+CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
+API_TIMEOUT_SECONDS = 30
+DECIDE_TIMEOUT_SECONDS = 10
+LOW_ARGUMENT_THRESHOLD = 0.1
+HIGH_ARGUMENT_THRESHOLD = 0.7
+DIFFICULTY_THRESHOLD = 0.3
+REPEAT_PREVENTION_LOOKBACK = 2
+MAX_RESPONSE_LENGTH = 500
+```
+
 ## Main Class
 
-### CoachPolicyAgent Class
+### CoachPolicyAgent
+
 ```python
 class CoachPolicyAgent:
-    """
-    AI debate coaching policy agent that decides coaching strategies and generates responses.
-    """
-    
-    # Class constants
-    MODEL_NAME = "claude-3-5-sonnet-20241022"
-    API_TIMEOUT = 30.0
-    DECIDE_TIMEOUT = 10.0
-    MAX_TOKENS = 150
-    
     def __init__(self, anthropic_api_key: str) -> None:
         """
-        Initialize the CoachPolicyAgent with Anthropic API client.
+        Initialize the coach policy agent with Anthropic client.
         
         Args:
-            anthropic_api_key: API key for Anthropic Claude service
+            anthropic_api_key: API key for Anthropic Claude access
+        """
+        
+    async def decide(self, analysis: TurnAnalysis, context: SessionContext) -> CoachingAction:
+        """
+        Main entry point to decide coaching action based on turn analysis.
+        ASYNC METHOD - calls Claude API
+        
+        Args:
+            analysis: TurnAnalysis object from TurnAnalyzer
+            context: Current session context and history
+            
+        Returns:
+            CoachingAction with strategy, response, and metadata
+            
+        Behavior:
+            - Completes within 10 seconds total
+            - Returns default action on any error (no exceptions raised)
+            - Handles empty transcript by returning PROBE with opening question
+        """
+        
+    def _select_strategy(self, analysis: TurnAnalysis, context: SessionContext) -> CoachingStrategy:
+        """
+        Select coaching strategy using rule-based logic.
+        SYNCHRONOUS METHOD - no LLM calls, pure deterministic logic
+        
+        Args:
+            analysis: TurnAnalysis object
+            context: SessionContext with history
+            
+        Returns:
+            CoachingStrategy enum value
+            
+        Rules (in priority order):
+            1. If mispronounced_words has severity==MAJOR: CORRECT_PRONUNCIATION
+            2. If transcript empty or argument_score < 0.1: REDIRECT  
+            3. If last 2 coaching_history entries same: force different strategy
+            4. If argument_score >= 0.7 and turn_number > 2: CHALLENGE
+            5. If argument_score >= 0.7: PRAISE_AND_PUSH
+            6. If has_claim=True but has_reasoning=False: PROBE
+            7. If has_reasoning=True but has_evidence=False: PROBE
+            8. Default: PROBE
+        """
+        
+    async def _generate_response(self, analysis: TurnAnalysis, context: SessionContext, strategy: CoachingStrategy) -> str:
+        """
+        Generate response text using Claude API.
+        ASYNC METHOD - makes HTTP call to Anthropic
+        
+        Args:
+            analysis: TurnAnalysis with student's input
+            context: Session context for personalization
+            strategy: Selected coaching strategy
+            
+        Returns:
+            Response text (1-3 sentences, markdown stripped)
+            
+        Behavior:
+            - Calls AsyncAnthropic.messages.create()
+            - Uses claude-3-5-sonnet model
+            - 30 second timeout on API call
+            - Strips markdown from response
+            - Returns conversational, partner-style response
+        """
+        
+    def _build_prompt(self, analysis: TurnAnalysis, context: SessionContext, strategy: CoachingStrategy) -> str:
+        """
+        Build prompt string for Claude API call.
+        SYNCHRONOUS METHOD - string construction only
+        
+        Args:
+            analysis: TurnAnalysis object
+            context: SessionContext for history
+            strategy: Selected strategy for prompt customization
+            
+        Returns:
+            Complete prompt string for Claude
+            
+        Content:
+            - Student transcript
+            - Strategy-specific instructions
+            - Debate topic and position
+            - Last 3 turns of coaching history
+            - Response format requirements (1-3 sentences, no bullet points)
+        """
+        
+    def _create_default_action(self, context: SessionContext) -> CoachingAction:
+        """
+        Create fallback CoachingAction for error cases.
+        SYNCHRONOUS METHOD - no external calls
+        
+        Args:
+            context: SessionContext for topic-relevant question
+            
+        Returns:
+            CoachingAction with strategy=PROBE and generic opening question
+        """
+        
+    def _calculate_difficulty_delta(self, context: SessionContext) -> int:
+        """
+        Calculate difficulty adjustment based on recent performance.
+        SYNCHRONOUS METHOD - pure calculation
+        
+        Args:
+            context: SessionContext with argument_scores history
+            
+        Returns:
+            -1 (easier), 0 (same), or +1 (harder)
+            
+        Logic:
+            +1 if last 2 argument_scores >= 0.7
+            -1 if last 2 argument_scores < 0.3
+             0 otherwise
+        """
+        
+    def _get_target_word(self, analysis: TurnAnalysis) -> str:
+        """
+        Extract target word for pronunciation correction.
+        SYNCHRONOUS METHOD - data extraction only
+        
+        Args:
+            analysis: TurnAnalysis with pronunciation data
+            
+        Returns:
+            First mispronounced word with MAJOR severity, or "" if none
+        """
+        
+    def _strip_markdown(self, text: str) -> str:
+        """
+        Remove markdown formatting from response text.
+        SYNCHRONOUS METHOD - regex processing
+        
+        Args:
+            text: Raw response from Claude
+            
+        Returns:
+            Clean text with markdown removed
+        """
+        
+    def _avoid_repetition(self, preferred_strategy: CoachingStrategy, context: SessionContext) -> CoachingStrategy:
+        """
+        Check if strategy was used in last 2 turns and return alternative.
+        SYNCHRONOUS METHOD - list processing
+        
+        Args:
+            preferred_strategy: Strategy selected by main rules
+            context: SessionContext with coaching_history
+            
+        Returns:
+            Original strategy or alternative if repetition detected
         """
 ```
 
-### Public Methods
+## Anthropic SDK Integration Pattern
 
-#### Main Entry Point
 ```python
-async def decide(self, analysis: TurnAnalysis, context: SessionContext) -> CoachingAction:
-    """
-    Main entry point to decide coaching action based on turn analysis.
-    
-    Args:
-        analysis: TurnAnalysis object containing student's turn data
-        context: SessionContext with session state and history
-        
-    Returns:
-        CoachingAction with strategy, response text, and metadata
-        
-    Notes:
-        - Completes within 10 seconds total
-        - Returns default action on any error (never raises)
-        - Handles empty transcript with PROBE strategy
-    """
-```
+# In __init__:
+self._client = AsyncAnthropic(api_key=anthropic_api_key)
 
-### Private Methods
-
-#### Strategy Selection
-```python
-def _select_strategy(self, analysis: TurnAnalysis, context: SessionContext) -> CoachingStrategy:
-    """
-    SYNCHRONOUS method to select coaching strategy using deterministic rules.
-    
-    Args:
-        analysis: TurnAnalysis object
-        context: SessionContext object
-        
-    Returns:
-        CoachingStrategy enum value
-        
-    Priority rules:
-        1. CORRECT_PRONUNCIATION if major mispronunciation detected
-        2. REDIRECT if empty/off-topic (argument_score < 0.1)
-        3. Skip strategy if used in last 2 turns
-        4. CHALLENGE if argument_score >= 0.7 and turn_number > 2
-        5. PRAISE_AND_PUSH if argument_score >= 0.7
-        6. PROBE if has_claim=True but has_reasoning=False
-        7. PROBE if has_reasoning=True but has_evidence=False
-        8. Default: PROBE
-    """
-```
-
-#### Response Generation
-```python
-async def _generate_response(
-    self, 
-    analysis: TurnAnalysis, 
-    context: SessionContext, 
-    strategy: CoachingStrategy
-) -> str:
-    """
-    Generate response text using Claude API.
-    
-    Args:
-        analysis: TurnAnalysis object
-        context: SessionContext object
-        strategy: Selected CoachingStrategy
-        
-    Returns:
-        Response text (1-3 sentences, markdown stripped)
-        
-    Notes:
-        - Calls Anthropic API with 30s timeout
-        - Includes last 3 turns of coaching history in prompt
-        - Strategy-specific response generation
-        - Strips markdown formatting from response
-    """
-```
-
-#### Prompt Building
-```python
-def _build_prompt(
-    self, 
-    analysis: TurnAnalysis, 
-    context: SessionContext, 
-    strategy: CoachingStrategy
-) -> str:
-    """
-    Build Claude API prompt string with strategy-specific instructions.
-    
-    Args:
-        analysis: TurnAnalysis object
-        context: SessionContext object
-        strategy: Selected CoachingStrategy
-        
-    Returns:
-        Complete prompt string for Claude API
-        
-    Includes:
-        - Student transcript
-        - Debate topic and position
-        - Strategy-specific instructions
-        - Response format requirements (1-3 sentences, no bullets)
-        - Last 3 coaching history entries
-    """
-```
-
-#### Difficulty Calculation
-```python
-def _calculate_difficulty_delta(self, context: SessionContext) -> int:
-    """
-    Calculate difficulty adjustment based on recent performance.
-    
-    Args:
-        context: SessionContext with argument_scores history
-        
-    Returns:
-        int: -1 (easier), 0 (same), +1 (harder)
-        
-    Logic:
-        +1 if last 2 argument_scores >= 0.7
-        -1 if last 2 argument_scores < 0.3
-         0 otherwise
-    """
-```
-
-#### Anti-Repetition Logic
-```python
-def _should_skip_strategy(self, strategy: CoachingStrategy, context: SessionContext) -> bool:
-    """
-    Check if strategy should be skipped due to recent usage.
-    
-    Args:
-        strategy: CoachingStrategy to check
-        context: SessionContext with coaching_history
-        
-    Returns:
-        bool: True if strategy was used in last 2 turns
-    """
-```
-
-#### Pronunciation Target Extraction
-```python
-def _get_pronunciation_target(self, analysis: TurnAnalysis) -> str:
-    """
-    Extract target word for pronunciation correction.
-    
-    Args:
-        analysis: TurnAnalysis object
-        
-    Returns:
-        str: First major mispronounced word, or "" if none
-    """
-```
-
-#### Fallback Action
-```python
-def _create_default_action(self, context: SessionContext) -> CoachingAction:
-    """
-    Create safe fallback CoachingAction.
-    
-    Args:
-        context: SessionContext for topic-relevant question
-        
-    Returns:
-        CoachingAction with strategy=PROBE and generic opening question
-    """
-```
-
-#### Utility Methods
-```python
-def _strip_markdown(self, text: str) -> str:
-    """
-    Remove markdown formatting from text.
-    
-    Args:
-        text: Input text potentially containing markdown
-        
-    Returns:
-        str: Text with markdown removed
-    """
-
-def _is_off_topic(self, analysis: TurnAnalysis) -> bool:
-    """
-    Determine if student response is off-topic.
-    
-    Args:
-        analysis: TurnAnalysis object
-        
-    Returns:
-        bool: True if argument_score < 0.1 or transcript is empty
-    """
-
-def _get_recent_strategies(self, context: SessionContext, count: int = 3) -> List[CoachingStrategy]:
-    """
-    Get most recent coaching strategies from history.
-    
-    Args:
-        context: SessionContext with coaching_history
-        count: Number of recent strategies to return
-        
-    Returns:
-        List[CoachingStrategy]: Recent strategies (newest first)
-    """
-```
-
-## External API Integration
-
-### Anthropic SDK Usage
-```python
-# Client initialization in __init__
-self._client = AsyncAnthropic(
-    api_key=anthropic_api_key,
-    timeout=self.API_TIMEOUT
-)
-
-# API call pattern in _generate_response
+# In _generate_response:
 response = await self._client.messages.create(
-    model=self.MODEL_NAME,
-    max_tokens=self.MAX_TOKENS,
-    temperature=0.7,
+    model=CLAUDE_MODEL,
+    max_tokens=MAX_RESPONSE_LENGTH,
+    timeout=API_TIMEOUT_SECONDS,
     messages=[{
-        "role": "user",
+        "role": "user", 
         "content": prompt
     }]
 )
+return response.content[0].text
 ```
 
-## Constants and Configuration
+## Error Handling Strategy
+
+- All exceptions in `decide()` caught and converted to default CoachingAction
+- API timeouts handled with fallback responses
+- Empty/invalid analysis objects handled gracefully
+- No exceptions propagated to caller
+
+## Key Implementation Details
+
+### Strategy Selection Logic
 
 ```python
-class CoachPolicyAgent:
-    # Anthropic API configuration
-    MODEL_NAME = "claude-3-5-sonnet-20241022"
-    API_TIMEOUT = 30.0
-    MAX_TOKENS = 150
-    
-    # Performance constraints
-    DECIDE_TIMEOUT = 10.0
-    
-    # Strategy selection thresholds
-    OFF_TOPIC_THRESHOLD = 0.1
-    STRONG_ARGUMENT_THRESHOLD = 0.7
-    WEAK_ARGUMENT_THRESHOLD = 0.3
-    
-    # Anti-repetition settings
-    MAX_CONSECUTIVE_SAME_STRATEGY = 2
-    
-    # Default response templates
-    DEFAULT_OPENING_QUESTIONS = {
-        "for": "What's your strongest reason for supporting this position?",
-        "against": "What's your main concern with this approach?",
-        "neutral": "What's your initial take on this topic?"
-    }
+# Priority-ordered rule evaluation:
+# 1. Check for major pronunciation issues
+# 2. Check for off-topic or empty input  
+# 3. Check for recent strategy repetition
+# 4. Check argument quality and turn number
+# 5. Check argument structure (claim/reasoning/evidence)
+# 6. Default to PROBE
 ```
 
-## Error Handling Patterns
+### Response Generation
 
-```python
-# In decide() method - never raise exceptions
-try:
-    # Strategy selection and response generation
-    pass
-except asyncio.TimeoutError:
-    return self._create_default_action(context)
-except Exception as e:
-    # Log error internally but don't raise
-    return self._create_default_action(context)
+- Model: `claude-3-5-sonnet-20241022`
+- Max tokens: 500
+- Timeout: 30 seconds  
+- Output: 1-3 sentences, conversational tone
+- No markdown, bullet points, or teacher-like praise
 
-# Timeout wrapper for decide()
-async def decide(self, analysis: TurnAnalysis, context: SessionContext) -> CoachingAction:
-    try:
-        return await asyncio.wait_for(
-            self._decide_internal(analysis, context),
-            timeout=self.DECIDE_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        return self._create_default_action(context)
-```
+### Anti-Repetition Logic
 
-## Import Requirements
+- Track last 2 strategies in coaching_history
+- If preferred strategy matches last 2, select next applicable strategy from priority list
+- Ensures variety in coaching approach
 
-The module requires these external dependencies:
-- `anthropic` - AsyncAnthropic client for Claude API
-- Standard library: `asyncio`, `re`, `enum`, `dataclasses`, `typing`
-
-Expected import of external types (not defined in this module):
-```python
-from turn_analyzer import TurnAnalysis  # Contains transcript, argument analysis, pronunciation data
-```
+This design provides a complete, implementable specification for coach_policy.py that meets all requirements and acceptance criteria.

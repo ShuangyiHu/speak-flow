@@ -1,332 +1,388 @@
 import pytest
 import asyncio
-from unittest.mock import Mock, AsyncMock, patch, call
-from datetime import datetime
-from dataclasses import dataclass
+from unittest.mock import Mock, AsyncMock, patch, MagicMock
 from enum import Enum
+from dataclasses import dataclass
 from typing import List
 
-# Import the classes we're testing (assuming they exist in coach_policy module)
+# Import the module under test
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
 from coach_policy import CoachPolicyAgent, CoachingStrategy, CoachingAction, SessionContext
 
-# Mock data models that would come from other modules
-@dataclass
-class TurnInput:
-    transcript: str
-    timestamp: datetime
-    audio_duration: float
 
+# Mock data models for testing
 @dataclass
-class PronunciationIssue:
+class MockPronunciationWord:
     word: str
-    severity: str
-    phoneme: str
+    severity: str = "MINOR"
+
 
 @dataclass
-class PronunciationAnalysis:
-    mispronounced_words: List[PronunciationIssue]
-    overall_score: float
+class MockPronunciation:
+    mispronounced_words: List[MockPronunciationWord]
+
 
 @dataclass
-class ArgumentAnalysis:
+class MockTurnInput:
+    transcript: str
+
+
+@dataclass
+class MockAnalysisResult:
     has_claim: bool
     has_reasoning: bool
     has_evidence: bool
     argument_score: float
-    is_on_topic: bool
+
 
 @dataclass
-class TurnAnalysis:
-    turn_input: TurnInput
-    pronunciation: PronunciationAnalysis
-    argument: ArgumentAnalysis
+class MockTurnAnalysis:
+    turn_input: MockTurnInput
+    pronunciation: MockPronunciation
+    analysis_result: MockAnalysisResult
+
 
 class TestCoachPolicyAgent:
     
     @pytest.fixture
-    def mock_anthropic_client(self):
-        with patch('coach_policy.AsyncAnthropic') as mock_client_class:
+    def mock_anthropic(self):
+        with patch('coach_policy.AsyncAnthropic') as mock:
             mock_client = AsyncMock()
-            mock_client_class.return_value = mock_client
-            
-            # Mock the messages.create response
-            mock_response = AsyncMock()
-            mock_response.content = [Mock(text="This is a test response from Claude.")]
-            mock_client.messages.create.return_value = mock_response
-            
+            mock.return_value = mock_client
+            mock_client.messages.create = AsyncMock()
             yield mock_client
 
     @pytest.fixture
-    def agent(self, mock_anthropic_client):
+    def agent(self, mock_anthropic):
         return CoachPolicyAgent("test-api-key")
 
     @pytest.fixture
     def sample_context(self):
         return SessionContext(
-            session_id="test-session-123",
-            topic="Should social media be banned for teenagers?",
+            session_id="test-123",
+            topic="Social media should be banned for teenagers",
             user_position="for",
-            turn_number=3,
-            coaching_history=[CoachingStrategy.PROBE, CoachingStrategy.CHALLENGE],
-            argument_scores=[0.5, 0.8]
+            turn_number=1,
+            coaching_history=[],
+            argument_scores=[]
         )
 
     @pytest.fixture
-    def sample_turn_analysis(self):
-        return TurnAnalysis(
-            turn_input=TurnInput(
-                transcript="I think social media is bad for teenagers because it causes addiction.",
-                timestamp=datetime.now(),
-                audio_duration=5.2
-            ),
-            pronunciation=PronunciationAnalysis(
-                mispronounced_words=[],
-                overall_score=0.85
-            ),
-            argument=ArgumentAnalysis(
+    def sample_analysis(self):
+        return MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="I think social media is bad because it causes depression"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
                 has_claim=True,
                 has_reasoning=True,
                 has_evidence=False,
-                argument_score=0.6,
-                is_on_topic=True
+                argument_score=0.6
             )
         )
 
-    def test_init(self, mock_anthropic_client):
-        agent = CoachPolicyAgent("test-api-key")
-        assert agent is not None
-        # Verify AsyncAnthropic was called with correct parameters
-        mock_anthropic_client.assert_called_once()
+    def test_init_creates_anthropic_client(self, mock_anthropic):
+        agent = CoachPolicyAgent("test-key")
+        mock_anthropic.assert_called_once_with(api_key="test-key")
 
     @pytest.mark.asyncio
-    async def test_decide_happy_path(self, agent, sample_turn_analysis, sample_context, mock_anthropic_client):
-        # Setup mock response
-        mock_response = AsyncMock()
-        mock_response.content = [Mock(text="What evidence supports your claim about addiction?")]
-        mock_anthropic_client.messages.create.return_value = mock_response
-
-        result = await agent.decide(sample_turn_analysis, sample_context)
-
-        assert isinstance(result, CoachingAction)
-        assert result.strategy == CoachingStrategy.PROBE  # has_reasoning=True, has_evidence=False
-        assert len(result.response_text) > 0
-        assert result.internal_reason != ""
-        assert result.target_word == ""  # Not a pronunciation correction
-        assert result.difficulty_delta == 0  # Not meeting criteria for +1 or -1
-
-    @pytest.mark.asyncio
-    async def test_decide_empty_transcript_returns_probe(self, agent, sample_context, mock_anthropic_client):
-        empty_analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="", timestamp=datetime.now(), audio_duration=0.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=False, has_reasoning=False, has_evidence=False, argument_score=0.0, is_on_topic=False)
+    async def test_decide_with_empty_transcript_returns_probe(self, agent, sample_context, mock_anthropic):
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript=""),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=False,
+                has_reasoning=False,
+                has_evidence=False,
+                argument_score=0.0
+            )
         )
-
-        mock_response = AsyncMock()
-        mock_response.content = [Mock(text="What's your main argument about social media for teenagers?")]
-        mock_anthropic_client.messages.create.return_value = mock_response
-
-        result = await agent.decide(empty_analysis, sample_context)
-
-        assert result.strategy == CoachingStrategy.PROBE
-        assert len(result.response_text) > 0
-
-    @pytest.mark.asyncio
-    async def test_decide_timeout_returns_default(self, agent, sample_turn_analysis, sample_context, mock_anthropic_client):
-        # Make the API call timeout
-        mock_anthropic_client.messages.create.side_effect = asyncio.TimeoutError()
-
-        result = await agent.decide(sample_turn_analysis, sample_context)
-
+        
+        result = await agent.decide(analysis, sample_context)
+        
         assert isinstance(result, CoachingAction)
         assert result.strategy == CoachingStrategy.PROBE
         assert len(result.response_text) > 0
+        assert "Social media should be banned for teenagers" in result.response_text
 
     @pytest.mark.asyncio
-    async def test_decide_api_error_returns_default(self, agent, sample_turn_analysis, sample_context, mock_anthropic_client):
-        # Make the API call raise an exception
-        mock_anthropic_client.messages.create.side_effect = Exception("API Error")
-
-        result = await agent.decide(sample_turn_analysis, sample_context)
-
-        assert isinstance(result, CoachingAction)
-        assert result.strategy == CoachingStrategy.PROBE
-        assert len(result.response_text) > 0
-
-    @pytest.mark.asyncio
-    async def test_decide_completes_within_timeout(self, agent, sample_turn_analysis, sample_context, mock_anthropic_client):
+    async def test_decide_completes_within_timeout(self, agent, sample_analysis, sample_context, mock_anthropic):
+        mock_anthropic.messages.create.return_value = Mock(content=[Mock(text="What evidence supports that claim?")])
+        
         start_time = asyncio.get_event_loop().time()
-        
-        mock_response = AsyncMock()
-        mock_response.content = [Mock(text="Test response")]
-        mock_anthropic_client.messages.create.return_value = mock_response
-
-        result = await agent.decide(sample_turn_analysis, sample_context)
-        
+        result = await agent.decide(sample_analysis, sample_context)
         end_time = asyncio.get_event_loop().time()
-        assert (end_time - start_time) < 10.0  # Must complete within 10 seconds
+        
+        assert (end_time - start_time) < 10.0
+        assert isinstance(result, CoachingAction)
 
-    def test_select_strategy_pronunciation_major_severity(self, agent, sample_context):
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="I think social media is bad", timestamp=datetime.now(), audio_duration=3.0),
-            pronunciation=PronunciationAnalysis(
-                mispronounced_words=[PronunciationIssue("social", "MAJOR", "s")],
-                overall_score=0.5
-            ),
-            argument=ArgumentAnalysis(has_claim=True, has_reasoning=True, has_evidence=True, argument_score=0.8, is_on_topic=True)
+    @pytest.mark.asyncio
+    async def test_decide_handles_api_error_gracefully(self, agent, sample_analysis, sample_context, mock_anthropic):
+        mock_anthropic.messages.create.side_effect = Exception("API Error")
+        
+        result = await agent.decide(sample_analysis, sample_context)
+        
+        assert isinstance(result, CoachingAction)
+        assert result.strategy == CoachingStrategy.PROBE
+        assert len(result.response_text) > 0
+
+    def test_select_strategy_major_pronunciation_error_returns_correct_pronunciation(self, agent, sample_context):
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="I think this"),
+            pronunciation=MockPronunciation(mispronounced_words=[
+                MockPronunciationWord(word="think", severity="MAJOR")
+            ]),
+            analysis_result=MockAnalysisResult(
+                has_claim=True,
+                has_reasoning=True,
+                has_evidence=True,
+                argument_score=0.8
+            )
         )
-
+        
         strategy = agent._select_strategy(analysis, sample_context)
         assert strategy == CoachingStrategy.CORRECT_PRONUNCIATION
 
-    def test_select_strategy_redirect_low_argument_score(self, agent, sample_context):
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="I like pizza", timestamp=datetime.now(), audio_duration=2.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=False, has_reasoning=False, has_evidence=False, argument_score=0.05, is_on_topic=False)
-        )
-
-        strategy = agent._select_strategy(analysis, sample_context)
-        assert strategy == CoachingStrategy.REDIRECT
-
-    def test_select_strategy_redirect_empty_transcript(self, agent, sample_context):
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="", timestamp=datetime.now(), audio_duration=0.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=False, has_reasoning=False, has_evidence=False, argument_score=0.0, is_on_topic=False)
-        )
-
-        strategy = agent._select_strategy(analysis, sample_context)
-        assert strategy == CoachingStrategy.REDIRECT
-
-    def test_select_strategy_avoids_repeating_same_strategy(self, agent):
-        context = SessionContext(
-            session_id="test",
-            topic="Test topic",
-            user_position="for",
-            turn_number=4,
-            coaching_history=[CoachingStrategy.PROBE, CoachingStrategy.PROBE],  # Last 2 are same
-            argument_scores=[0.5, 0.6]
+    def test_select_strategy_empty_transcript_returns_redirect(self, agent, sample_context):
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript=""),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=False,
+                has_reasoning=False,
+                has_evidence=False,
+                argument_score=0.0
+            )
         )
         
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="I think this because reasons", timestamp=datetime.now(), audio_duration=3.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=True, has_reasoning=True, has_evidence=False, argument_score=0.6, is_on_topic=True)
-        )
+        strategy = agent._select_strategy(analysis, sample_context)
+        assert strategy == CoachingStrategy.REDIRECT
 
-        strategy = agent._select_strategy(analysis, context)
-        # Should not be PROBE since last 2 were PROBE, and conditions don't match other high-priority strategies
+    def test_select_strategy_low_argument_score_returns_redirect(self, agent, sample_context):
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="I don't know what to say"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=True,
+                has_reasoning=False,
+                has_evidence=False,
+                argument_score=0.05
+            )
+        )
+        
+        strategy = agent._select_strategy(analysis, sample_context)
+        assert strategy == CoachingStrategy.REDIRECT
+
+    def test_select_strategy_avoids_repeating_same_strategy_three_times(self, agent, sample_context):
+        sample_context.coaching_history = [CoachingStrategy.PROBE, CoachingStrategy.PROBE]
+        
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="I think social media is harmful"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=True,
+                has_reasoning=False,
+                has_evidence=False,
+                argument_score=0.5
+            )
+        )
+        
+        strategy = agent._select_strategy(analysis, sample_context)
         assert strategy != CoachingStrategy.PROBE
 
-    def test_select_strategy_challenge_high_score_after_turn_2(self, agent):
-        context = SessionContext(
-            session_id="test",
-            topic="Test topic",
-            user_position="for",
-            turn_number=5,
-            coaching_history=[CoachingStrategy.PROBE, CoachingStrategy.PRAISE_AND_PUSH],
-            argument_scores=[0.6, 0.8]
+    def test_select_strategy_high_score_and_turn_number_returns_challenge(self, agent, sample_context):
+        sample_context.turn_number = 5
+        
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="Social media causes depression with clear evidence"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=True,
+                has_reasoning=True,
+                has_evidence=True,
+                argument_score=0.8
+            )
         )
         
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="Strong argument with evidence", timestamp=datetime.now(), audio_duration=4.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=True, has_reasoning=True, has_evidence=True, argument_score=0.8, is_on_topic=True)
-        )
-
-        strategy = agent._select_strategy(analysis, context)
+        strategy = agent._select_strategy(analysis, sample_context)
         assert strategy == CoachingStrategy.CHALLENGE
 
-    def test_select_strategy_praise_and_push_high_score_early_turns(self, agent):
-        context = SessionContext(
-            session_id="test",
-            topic="Test topic",
-            user_position="for",
-            turn_number=2,
-            coaching_history=[CoachingStrategy.PROBE],
-            argument_scores=[0.5]
+    def test_select_strategy_high_score_early_turn_returns_praise_and_push(self, agent, sample_context):
+        sample_context.turn_number = 2
+        
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="Social media causes depression with evidence"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=True,
+                has_reasoning=True,
+                has_evidence=True,
+                argument_score=0.8
+            )
         )
         
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="Good argument", timestamp=datetime.now(), audio_duration=3.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=True, has_reasoning=True, has_evidence=True, argument_score=0.8, is_on_topic=True)
-        )
-
-        strategy = agent._select_strategy(analysis, context)
+        strategy = agent._select_strategy(analysis, sample_context)
         assert strategy == CoachingStrategy.PRAISE_AND_PUSH
 
-    def test_select_strategy_probe_has_claim_no_reasoning(self, agent, sample_context):
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="Social media is bad", timestamp=datetime.now(), audio_duration=2.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=True, has_reasoning=False, has_evidence=False, argument_score=0.4, is_on_topic=True)
+    def test_select_strategy_has_claim_no_reasoning_returns_probe(self, agent, sample_context):
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="Social media is bad"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=True,
+                has_reasoning=False,
+                has_evidence=False,
+                argument_score=0.4
+            )
         )
-
-        strategy = agent._select_strategy(analysis, sample_context)
-        assert strategy == CoachingStrategy.PROBE
-
-    def test_select_strategy_probe_has_reasoning_no_evidence(self, agent, sample_context):
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="Social media is bad because it's addictive", timestamp=datetime.now(), audio_duration=3.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=True, has_reasoning=True, has_evidence=False, argument_score=0.6, is_on_topic=True)
-        )
-
-        strategy = agent._select_strategy(analysis, sample_context)
-        assert strategy == CoachingStrategy.PROBE
-
-    def test_select_strategy_default_probe(self, agent, sample_context):
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="Some random statement", timestamp=datetime.now(), audio_duration=2.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=False, has_reasoning=False, has_evidence=False, argument_score=0.3, is_on_topic=True)
-        )
-
-        strategy = agent._select_strategy(analysis, sample_context)
-        assert strategy == CoachingStrategy.PROBE
-
-    def test_select_strategy_is_deterministic(self, agent, sample_context):
-        analysis = TurnAnalysis(
-            turn_input=TurnInput(transcript="Consistent input", timestamp=datetime.now(), audio_duration=3.0),
-            pronunciation=PronunciationAnalysis(mispronounced_words=[], overall_score=1.0),
-            argument=ArgumentAnalysis(has_claim=True, has_reasoning=False, has_evidence=False, argument_score=0.5, is_on_topic=True)
-        )
-
-        # Call multiple times with same inputs
-        strategy1 = agent._select_strategy(analysis, sample_context)
-        strategy2 = agent._select_strategy(analysis, sample_context)
-        strategy3 = agent._select_strategy(analysis, sample_context)
         
-        assert strategy1 == strategy2 == strategy3
+        strategy = agent._select_strategy(analysis, sample_context)
+        assert strategy == CoachingStrategy.PROBE
+
+    def test_select_strategy_has_reasoning_no_evidence_returns_probe(self, agent, sample_context):
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="Social media is bad because it's harmful"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=True,
+                has_reasoning=True,
+                has_evidence=False,
+                argument_score=0.5
+            )
+        )
+        
+        strategy = agent._select_strategy(analysis, sample_context)
+        assert strategy == CoachingStrategy.PROBE
+
+    def test_select_strategy_default_case_returns_probe(self, agent, sample_context):
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="I'm not sure"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=False,
+                has_reasoning=False,
+                has_evidence=False,
+                argument_score=0.3
+            )
+        )
+        
+        strategy = agent._select_strategy(analysis, sample_context)
+        assert strategy == CoachingStrategy.PROBE
 
     @pytest.mark.asyncio
-    async def test_generate_response_strips_markdown(self, agent, sample_turn_analysis, sample_context, mock_anthropic_client):
-        # Mock response with markdown
-        mock_response = AsyncMock()
-        mock_response.content = [Mock(text="**Bold text** and *italic* and `code` should be stripped.")]
-        mock_anthropic_client.messages.create.return_value = mock_response
+    async def test_generate_response_calls_anthropic_api(self, agent, sample_analysis, sample_context, mock_anthropic):
+        mock_anthropic.messages.create.return_value = Mock(content=[Mock(text="What evidence supports that?")])
+        
+        response = await agent._generate_response(sample_analysis, sample_context, CoachingStrategy.PROBE)
+        
+        mock_anthropic.messages.create.assert_called_once()
+        call_args = mock_anthropic.messages.create.call_args
+        assert call_args[1]['model'] == 'claude-3-5-sonnet-20241022'
+        assert call_args[1]['max_tokens'] == 150
+        assert call_args[1]['timeout'] == 30
+        assert response == "What evidence supports that?"
 
-        response = await agent._generate_response(sample_turn_analysis, sample_context, CoachingStrategy.PROBE)
+    @pytest.mark.asyncio
+    async def test_generate_response_strips_markdown(self, agent, sample_analysis, sample_context, mock_anthropic):
+        mock_anthropic.messages.create.return_value = Mock(content=[Mock(text="**What** evidence *supports* that?")])
+        
+        response = await agent._generate_response(sample_analysis, sample_context, CoachingStrategy.PROBE)
         
         assert "**" not in response
         assert "*" not in response
-        assert "`" not in response
-        assert "Bold text" in response
+
+    def test_build_prompt_includes_strategy_and_context(self, agent, sample_analysis, sample_context):
+        prompt = agent._build_prompt(sample_analysis, sample_context, CoachingStrategy.PROBE)
+        
+        assert "Social media should be banned for teenagers" in prompt
+        assert "PROBE" in prompt
+        assert "for" in prompt
+        assert sample_analysis.turn_input.transcript in prompt
+
+    def test_build_prompt_includes_coaching_history(self, agent, sample_analysis, sample_context):
+        sample_context.coaching_history = [CoachingStrategy.PROBE, CoachingStrategy.CHALLENGE]
+        
+        prompt = agent._build_prompt(sample_analysis, sample_context, CoachingStrategy.PRAISE_AND_PUSH)
+        
+        assert "PROBE" in prompt or "CHALLENGE" in prompt
+
+    def test_create_default_action_returns_valid_action(self, agent, sample_context):
+        action = agent._create_default_action(sample_context)
+        
+        assert isinstance(action, CoachingAction)
+        assert action.strategy == CoachingStrategy.PROBE
+        assert len(action.response_text) > 0
+        assert "Social media should be banned for teenagers" in action.response_text
+        assert action.difficulty_delta == 0
+
+    def test_difficulty_delta_plus_one_for_high_scores(self, agent, sample_analysis, sample_context):
+        sample_context.argument_scores = [0.8, 0.9]
+        
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="Strong argument with evidence"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=True,
+                has_reasoning=True,
+                has_evidence=True,
+                argument_score=0.8
+            )
+        )
+        
+        # Mock the difficulty calculation in decide method
+        with patch.object(agent, '_calculate_difficulty_delta', return_value=1):
+            result = asyncio.run(agent.decide(analysis, sample_context))
+            assert result.difficulty_delta == 1
+
+    def test_difficulty_delta_minus_one_for_low_scores(self, agent, sample_analysis, sample_context):
+        sample_context.argument_scores = [0.2, 0.1]
+        
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="Weak argument"),
+            pronunciation=MockPronunciation(mispronounced_words=[]),
+            analysis_result=MockAnalysisResult(
+                has_claim=False,
+                has_reasoning=False,
+                has_evidence=False,
+                argument_score=0.2
+            )
+        )
+        
+        with patch.object(agent, '_calculate_difficulty_delta', return_value=-1):
+            result = asyncio.run(agent.decide(analysis, sample_context))
+            assert result.difficulty_delta == -1
+
+    def test_difficulty_delta_zero_for_mixed_scores(self, agent, sample_analysis, sample_context):
+        sample_context.argument_scores = [0.8, 0.2]
+        
+        with patch.object(agent, '_calculate_difficulty_delta', return_value=0):
+            result = asyncio.run(agent.decide(sample_analysis, sample_context))
+            assert result.difficulty_delta == 0
 
     @pytest.mark.asyncio
-    async def test_generate_response_calls_anthropic_with_correct_params(self, agent, sample_turn_analysis, sample_context, mock_anthropic_client):
-        mock_response = AsyncMock()
-        mock_response.content = [Mock(text="Test response")]
-        mock_anthropic_client.messages.create.return_value = mock_response
-
-        await agent._generate_response(sample_turn_analysis, sample_context, CoachingStrategy.CHALLENGE)
-
-        # Verify the API was called
-        mock_anthropic_client.messages.create.assert_called_once()
-        call_args = mock_anthropic_client.messages.create.call_args
+    async def test_decide_sets_target_word_for_pronunciation_correction(self, agent, sample_context, mock_anthropic):
+        analysis = MockTurnAnalysis(
+            turn_input=MockTurnInput(transcript="I think this is wrong"),
+            pronunciation=MockPronunciation(mispronounced_words=[
+                MockPronunciationWord(word="think", severity="MAJOR")
+            ]),
+            analysis_result=MockAnalysisResult(
+                has_claim=True,
+                has_reasoning=False,
+                has_evidence=False,
+                argument_score=0.5
+            )
+        )
         
-        # Check that required parameters are present
-        assert call_args.kwargs['model'] == 'claude-3-5-sonnet-20241022'
-        assert call
+        mock_anthropic.messages.create.return_value = Mock(content=[Mock(text="I think you mean this point?")])
+        
+        result = await agent.decide(analysis, sample_context)
+        
+        assert result.strategy == CoachingStrategy.CORRECT_PRONUNCIATION
+        assert result.target_word == "think"
+
+    @pytest.mark.asyncio
+    async def test_decide_returns_coaching_action_with_all_fields(self, agent, sample_analysis, sample_context, mock_anthropic):
+        

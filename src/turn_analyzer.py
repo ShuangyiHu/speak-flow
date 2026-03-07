@@ -65,12 +65,12 @@ class TurnAnalysis:
 
 
 # Configuration constants
-ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022"
-ANALYSIS_TIMEOUT_SECONDS = 3.0
+ANTHROPIC_MODEL = "claude-sonnet-4-5"
+ANALYSIS_TIMEOUT_SECONDS = 30.0
 DEFAULT_ARGUMENT_SCORE = 0.0
 DEFAULT_FLUENCY_SCORE = 0.8
 MFA_TIMEOUT_SECONDS = 2.5
-ANTHROPIC_TIMEOUT_SECONDS = 2.0
+ANTHROPIC_TIMEOUT_SECONDS = 30.0
 
 # Environment variables
 USE_STUB_MFA = os.getenv("USE_STUB_MFA", "False").lower() == "true"
@@ -81,7 +81,7 @@ MFA_ACOUSTIC_MODEL_PATH = os.getenv("MFA_ACOUSTIC_MODEL_PATH", "/path/to/acousti
 class TurnAnalyzer:
     def __init__(self, anthropic_api_key: str):
         """Initialize TurnAnalyzer with Anthropic client."""
-        self.anthropic_client = AsyncAnthropic(api_key=anthropic_api_key)
+        self.anthropic_client = AsyncAnthropic(api_key=anthropic_api_key, timeout=ANTHROPIC_TIMEOUT_SECONDS)
         self.use_stub_mfa = USE_STUB_MFA
 
     async def analyze(self, turn_input: TurnInput) -> TurnAnalysis:
@@ -157,7 +157,6 @@ class TurnAnalyzer:
                 model=ANTHROPIC_MODEL,
                 max_tokens=1000,
                 temperature=0.1,
-                timeout=ANTHROPIC_TIMEOUT_SECONDS,
                 messages=[{
                     "role": "user",
                     "content": prompt

@@ -141,5 +141,6 @@ class SpeakFlowDevTeam():
             agents=[self.revision_engineer(), self.code_reviewer()],
             tasks=[revision_task, re_review_task],
             process=Process.sequential,
+            tracing=True,
             verbose=True,
         )

@@ -217,7 +217,8 @@ class CoachPolicyAgent:
             )
             
             response_text = response.content[0].text
-            return self._strip_markdown(response_text)
+            response_text = re.sub(r"```[a-z]*\n?|```", "", response_text).strip()
+            return response_text
             
         except Exception:
             return self._get_fallback_response(strategy, context, analysis)

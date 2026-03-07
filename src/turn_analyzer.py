@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -288,7 +289,8 @@ Respond in this exact JSON format:
             ArgumentResult: Parsed argument analysis
         """
         try:
-            data = json.loads(response_text.strip())
+            response_text = re.sub(r"```json|```", "", response_text).strip()
+            data = json.loads(response_text)
             
             return ArgumentResult(
                 has_claim=data.get("has_claim", False),

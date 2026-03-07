@@ -1,17 +1,17 @@
 design_task:
   description: >
     Read the following requirements and produce a detailed technical design for {module_name}.
-    
+
     REQUIREMENTS:
     {requirements}
-    
+
     Your design must specify:
     - All dataclasses / Pydantic models with field names and types
     - The main class {class_name} with all method signatures (name, parameters, return types)
     - Async vs sync distinction for each method
     - Any constants or configuration values
     - External dependencies and how they are called (Anthropic SDK, MFA subprocess, etc.)
-    
+
     Format: Markdown with code blocks for signatures. Be precise — no vague descriptions.
   expected_output: >
     A detailed markdown design document with all classes, dataclasses, and method signatures
@@ -22,10 +22,10 @@ design_task:
 code_task:
   description: >
     Implement the Python module {module_name} based on the architect's design.
-    
+
     REQUIREMENTS:
     {requirements}
-    
+
     Rules:
     - Output ONLY raw Python code, no markdown fences
     - All classes and methods must match the design exactly
@@ -42,20 +42,20 @@ code_task:
 review_task:
   description: >
     Review the implementation of {module_name}.
-    
+
     Check against these criteria:
     1. All interfaces match the design spec
     2. No blocking I/O inside async functions (use asyncio.to_thread or executor)
     3. Proper exception handling (no bare except:)
     4. Anthropic API called correctly using the Python SDK
     5. MFA stub is present and toggleable
-    
+
     Output format:
     DECISION: APPROVE or REQUEST_CHANGES
-    
+
     ISSUES (if any):
     - [CRITICAL/MINOR] Description of issue and suggested fix
-    
+
     SUMMARY: One paragraph assessment.
   expected_output: >
     A structured code review with APPROVE or REQUEST_CHANGES decision and specific issues.
@@ -68,7 +68,7 @@ review_task:
 test_task:
   description: >
     Write a pytest test suite for {module_name}.
-    
+
     Requirements:
     - Use pytest-asyncio for all async tests
     - Mock anthropic.Anthropic client
@@ -76,7 +76,7 @@ test_task:
     - Cover all acceptance criteria from the requirements:
       {requirements}
     - File must be importable and runnable with: pytest test_{module_name}
-    
+
     Output ONLY raw Python code. No markdown. No backticks.
   expected_output: >
     Raw Python test code for test_{module_name}. No markdown. Valid pytest file only.
@@ -89,14 +89,14 @@ test_task:
 frontend_task:
   description: >
     Write a Gradio UI prototype in app.py for {module_name}.
-    
+
     The UI should have:
     - Audio recording input (gr.Audio with microphone source)
     - Text box showing transcript
     - Argument feedback: claim/reason/evidence checkboxes, score, summary
     - Pronunciation feedback: list of mispronounced words with IPA
     - A "Analyze" button that calls TurnAnalyzer.analyze()
-    
+
     Use USE_STUB_MFA=True so the demo runs without MFA installed.
     Import {class_name} from {module_name} (strip .py extension).
     Output ONLY raw Python. No markdown. No backticks.

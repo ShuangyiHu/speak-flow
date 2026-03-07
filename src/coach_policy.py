@@ -1,18 +1,23 @@
+from anthropic import AsyncAnthropic
+from dataclasses import dataclass
+from enum import Enum
+from typing import List, Optional
 import asyncio
 import re
-from enum import Enum
-from dataclasses import dataclass
-from typing import List, Optional
-from anthropic import AsyncAnthropic
 
-# Import external types
-try:
-    from turn_analyzer import TurnAnalysis
-except ImportError:
-    # TODO: Add proper TurnAnalysis import when available
-    class TurnAnalysis:
-        pass
+# Constants
+CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
+API_TIMEOUT_SECONDS = 30
+DECIDE_TIMEOUT_SECONDS = 10
+LOW_ARGUMENT_THRESHOLD = 0.1
+HIGH_ARGUMENT_THRESHOLD = 0.7
+DIFFICULTY_THRESHOLD = 0.3
+REPEAT_PREVENTION_LOOKBACK = 2
+MAX_RESPONSE_LENGTH = 500
 
+# Import TurnAnalysis type from design spec
+from typing import Any
+TurnAnalysis = Any  # Placeholder until actual TurnAnalysis is available
 
 class CoachingStrategy(Enum):
     PROBE = "probe"
@@ -21,279 +26,283 @@ class CoachingStrategy(Enum):
     PRAISE_AND_PUSH = "praise_and_push"
     CORRECT_PRONUNCIATION = "correct_pronunciation"
 
-
 @dataclass
 class CoachingAction:
     strategy: CoachingStrategy
     response_text: str
     internal_reason: str
-    target_word: str = ""
-    difficulty_delta: int = 0
-
+    target_word: str
+    difficulty_delta: int
 
 @dataclass
 class SessionContext:
     session_id: str
     topic: str
-    user_position: str  # "for" or "against"
+    user_position: str
     turn_number: int
     coaching_history: List[CoachingStrategy]
     argument_scores: List[float]
 
-
 class CoachPolicyAgent:
-    """
-    AI debate coaching policy agent that decides coaching strategies and generates responses.
-    """
-    
-    # Class constants
-    MODEL_NAME = "claude-3-5-sonnet-20241022"
-    API_TIMEOUT = 30.0
-    DECIDE_TIMEOUT = 10.0
-    MAX_TOKENS = 150
-    
-    # Strategy selection thresholds
-    OFF_TOPIC_THRESHOLD = 0.1
-    STRONG_ARGUMENT_THRESHOLD = 0.7
-    WEAK_ARGUMENT_THRESHOLD = 0.3
-    
-    # Anti-repetition settings
-    MAX_CONSECUTIVE_SAME_STRATEGY = 2
-    
-    # Default response templates
-    DEFAULT_OPENING_QUESTIONS = {
-        "for": "What's your strongest reason for supporting this position?",
-        "against": "What's your main concern with this approach?",
-        "neutral": "What's your initial take on this topic?"
-    }
-
-    def __init__(self, anthropic_api_key: str) -> None:
+    def __init__(self, anthropic_api_key: str, mfa_enabled: bool = False) -> None:
         """
-        Initialize the CoachPolicyAgent with Anthropic API client.
+        Initialize the coach policy agent with Anthropic client.
         
         Args:
-            anthropic_api_key: API key for Anthropic Claude service
+            anthropic_api_key: API key for Anthropic Claude access
+            mfa_enabled: Whether MFA is enabled (toggleable)
         """
-        self._client = AsyncAnthropic(
-            api_key=anthropic_api_key,
-            timeout=self.API_TIMEOUT
-        )
-
+        self._client = AsyncAnthropic(api_key=anthropic_api_key)
+        self._mfa_enabled = mfa_enabled
+        
     async def decide(self, analysis: TurnAnalysis, context: SessionContext) -> CoachingAction:
         """
         Main entry point to decide coaching action based on turn analysis.
+        ASYNC METHOD - calls Claude API
         
         Args:
-            analysis: TurnAnalysis object containing student's turn data
-            context: SessionContext with session state and history
+            analysis: TurnAnalysis object from TurnAnalyzer
+            context: Current session context and history
             
         Returns:
-            CoachingAction with strategy, response text, and metadata
+            CoachingAction with strategy, response, and metadata
             
-        Notes:
+        Behavior:
             - Completes within 10 seconds total
-            - Returns default action on any error (never raises)
-            - Handles empty transcript with PROBE strategy
+            - Returns default action on any error (no exceptions raised)
+            - Handles empty transcript by returning PROBE with opening question
         """
         try:
-            return await asyncio.wait_for(
-                self._decide_internal(analysis, context),
-                timeout=self.DECIDE_TIMEOUT
+            # MFA check if enabled
+            if self._mfa_enabled:
+                await self._perform_mfa_check()
+            
+            # Handle empty transcript
+            if not hasattr(analysis, 'turn_input') or not hasattr(analysis.turn_input, 'transcript') or not analysis.turn_input.transcript.strip():
+                return self._create_default_action(context)
+            
+            # Select strategy
+            strategy = self._select_strategy(analysis, context)
+            
+            # Generate response with timeout
+            response_task = self._generate_response(analysis, context, strategy)
+            response_text = await asyncio.wait_for(response_task, timeout=DECIDE_TIMEOUT_SECONDS)
+            
+            # Calculate difficulty delta
+            difficulty_delta = self._calculate_difficulty_delta(context)
+            
+            # Get target word for pronunciation correction
+            target_word = self._get_target_word(analysis) if strategy == CoachingStrategy.CORRECT_PRONUNCIATION else ""
+            
+            # Build internal reason
+            internal_reason = f"Selected {strategy.value} strategy based on analysis"
+            
+            return CoachingAction(
+                strategy=strategy,
+                response_text=response_text,
+                internal_reason=internal_reason,
+                target_word=target_word,
+                difficulty_delta=difficulty_delta
             )
-        except asyncio.TimeoutError:
-            return self._create_default_action(context)
+            
         except Exception:
             return self._create_default_action(context)
-
-    async def _decide_internal(self, analysis: TurnAnalysis, context: SessionContext) -> CoachingAction:
-        """Internal implementation of decide logic."""
-        # Handle empty transcript
-        if not hasattr(analysis, 'turn_input') or not hasattr(analysis.turn_input, 'transcript') or not analysis.turn_input.transcript.strip():
-            return CoachingAction(
-                strategy=CoachingStrategy.PROBE,
-                response_text=self._get_opening_question(context),
-                internal_reason="Empty transcript - opening question",
-                difficulty_delta=0
-            )
+    
+    async def _perform_mfa_check(self) -> None:
+        """
+        MFA stub implementation - toggleable security feature.
+        ASYNC METHOD - simulates MFA verification
         
-        # Select strategy
-        strategy = self._select_strategy(analysis, context)
-        
-        # Generate response
-        response_text = await self._generate_response(analysis, context, strategy)
-        
-        # Calculate difficulty delta
-        difficulty_delta = self._calculate_difficulty_delta(context)
-        
-        # Get target word for pronunciation correction
-        target_word = self._get_pronunciation_target(analysis) if strategy == CoachingStrategy.CORRECT_PRONUNCIATION else ""
-        
-        return CoachingAction(
-            strategy=strategy,
-            response_text=response_text,
-            internal_reason=f"Selected {strategy.value} based on analysis",
-            target_word=target_word,
-            difficulty_delta=difficulty_delta
-        )
-
+        Behavior:
+            - No-op when MFA is disabled
+            - Simulates MFA verification delay when enabled
+        """
+        if self._mfa_enabled:
+            # Stub implementation - in production this would verify MFA token
+            await asyncio.sleep(0.1)  # Simulate MFA verification delay
+    
     def _select_strategy(self, analysis: TurnAnalysis, context: SessionContext) -> CoachingStrategy:
         """
-        SYNCHRONOUS method to select coaching strategy using deterministic rules.
+        Select coaching strategy using rule-based logic.
+        SYNCHRONOUS METHOD - no LLM calls, pure deterministic logic
         
         Args:
             analysis: TurnAnalysis object
-            context: SessionContext object
+            context: SessionContext with history
             
         Returns:
             CoachingStrategy enum value
             
-        Priority rules:
-            1. CORRECT_PRONUNCIATION if major mispronunciation detected
-            2. REDIRECT if empty/off-topic (argument_score < 0.1)
-            3. Skip strategy if used in last 2 turns
-            4. CHALLENGE if argument_score >= 0.7 and turn_number > 2
-            5. PRAISE_AND_PUSH if argument_score >= 0.7
-            6. PROBE if has_claim=True but has_reasoning=False
-            7. PROBE if has_reasoning=True but has_evidence=False
+        Rules (in priority order):
+            1. If mispronounced_words has severity==MAJOR: CORRECT_PRONUNCIATION
+            2. If transcript empty or argument_score < 0.1: REDIRECT  
+            3. If last 2 coaching_history entries same: force different strategy
+            4. If argument_score >= 0.7 and turn_number > 2: CHALLENGE
+            5. If argument_score >= 0.7: PRAISE_AND_PUSH
+            6. If has_claim=True but has_reasoning=False: PROBE
+            7. If has_reasoning=True but has_evidence=False: PROBE
             8. Default: PROBE
         """
-        # Rule 1: Major mispronunciation
-        if (hasattr(analysis, 'pronunciation') and 
-            hasattr(analysis.pronunciation, 'mispronounced_words') and
-            any(getattr(word, 'severity', None) == 'MAJOR' for word in analysis.pronunciation.mispronounced_words)):
-            return CoachingStrategy.CORRECT_PRONUNCIATION
+        # Rule 1: Check for major pronunciation issues
+        if hasattr(analysis, 'pronunciation') and hasattr(analysis.pronunciation, 'mispronounced_words'):
+            for word in analysis.pronunciation.mispronounced_words:
+                if hasattr(word, 'severity') and word.severity == 'MAJOR':
+                    preferred = CoachingStrategy.CORRECT_PRONUNCIATION
+                    return self._avoid_repetition(preferred, context)
         
-        # Rule 2: Off-topic or empty
-        if self._is_off_topic(analysis):
-            return CoachingStrategy.REDIRECT
-        
-        # Get argument score
+        # Rule 2: Check for off-topic or empty input
         argument_score = getattr(analysis, 'argument_score', 0.0) if hasattr(analysis, 'argument_score') else 0.0
+        if argument_score < LOW_ARGUMENT_THRESHOLD:
+            preferred = CoachingStrategy.REDIRECT
+            return self._avoid_repetition(preferred, context)
         
-        # Get argument structure flags
-        has_claim = getattr(analysis, 'has_claim', False) if hasattr(analysis, 'has_claim') else False
-        has_reasoning = getattr(analysis, 'has_reasoning', False) if hasattr(analysis, 'has_reasoning') else False
-        has_evidence = getattr(analysis, 'has_evidence', False) if hasattr(analysis, 'has_evidence') else False
+        # Rule 4: High quality argument with experience
+        if argument_score >= HIGH_ARGUMENT_THRESHOLD and context.turn_number > 2:
+            preferred = CoachingStrategy.CHALLENGE
+            result = self._avoid_repetition(preferred, context)
+            return result
         
-        strategies_to_try = []
+        # Rule 5: High quality argument
+        if argument_score >= HIGH_ARGUMENT_THRESHOLD:
+            preferred = CoachingStrategy.PRAISE_AND_PUSH
+            result = self._avoid_repetition(preferred, context)
+            return result
         
-        # Rules 4-8: Build priority list
-        if argument_score >= self.STRONG_ARGUMENT_THRESHOLD and context.turn_number > 2:
-            strategies_to_try.append(CoachingStrategy.CHALLENGE)
+        # Rule 6: Has claim but no reasoning
+        if hasattr(analysis, 'has_claim') and hasattr(analysis, 'has_reasoning'):
+            if analysis.has_claim and not analysis.has_reasoning:
+                preferred = CoachingStrategy.PROBE
+                return self._avoid_repetition(preferred, context)
         
-        if argument_score >= self.STRONG_ARGUMENT_THRESHOLD:
-            strategies_to_try.append(CoachingStrategy.PRAISE_AND_PUSH)
+        # Rule 7: Has reasoning but no evidence
+        if hasattr(analysis, 'has_reasoning') and hasattr(analysis, 'has_evidence'):
+            if analysis.has_reasoning and not analysis.has_evidence:
+                preferred = CoachingStrategy.PROBE
+                return self._avoid_repetition(preferred, context)
         
-        if has_claim and not has_reasoning:
-            strategies_to_try.append(CoachingStrategy.PROBE)
-        
-        if has_reasoning and not has_evidence:
-            strategies_to_try.append(CoachingStrategy.PROBE)
-        
-        # Default
-        strategies_to_try.append(CoachingStrategy.PROBE)
-        
-        # Rule 3: Skip if used in last 2 turns
-        for strategy in strategies_to_try:
-            if not self._should_skip_strategy(strategy, context):
-                return strategy
-        
-        # Fallback to first strategy if all are skipped
-        return strategies_to_try[0] if strategies_to_try else CoachingStrategy.PROBE
-
+        # Rule 8: Default
+        preferred = CoachingStrategy.PROBE
+        return self._avoid_repetition(preferred, context)
+    
     async def _generate_response(self, analysis: TurnAnalysis, context: SessionContext, strategy: CoachingStrategy) -> str:
         """
         Generate response text using Claude API.
+        ASYNC METHOD - makes HTTP call to Anthropic
         
         Args:
-            analysis: TurnAnalysis object
-            context: SessionContext object
-            strategy: Selected CoachingStrategy
+            analysis: TurnAnalysis with student's input
+            context: Session context for personalization
+            strategy: Selected coaching strategy
             
         Returns:
             Response text (1-3 sentences, markdown stripped)
             
-        Notes:
-            - Calls Anthropic API with 30s timeout
-            - Includes last 3 turns of coaching history in prompt
-            - Strategy-specific response generation
-            - Strips markdown formatting from response
+        Behavior:
+            - Calls AsyncAnthropic.messages.create()
+            - Uses claude-3-5-sonnet model
+            - 30 second timeout on API call
+            - Strips markdown from response
+            - Returns conversational, partner-style response
         """
         try:
             prompt = self._build_prompt(analysis, context, strategy)
             
             response = await self._client.messages.create(
-                model=self.MODEL_NAME,
-                max_tokens=self.MAX_TOKENS,
-                temperature=0.7,
+                model=CLAUDE_MODEL,
+                max_tokens=MAX_RESPONSE_LENGTH,
+                timeout=API_TIMEOUT_SECONDS,
                 messages=[{
                     "role": "user",
                     "content": prompt
                 }]
             )
             
-            response_text = response.content[0].text if response.content else ""
+            response_text = response.content[0].text
             return self._strip_markdown(response_text)
             
         except Exception:
-            return self._get_fallback_response(strategy, context)
-
+            return self._get_fallback_response(strategy, context, analysis)
+    
     def _build_prompt(self, analysis: TurnAnalysis, context: SessionContext, strategy: CoachingStrategy) -> str:
         """
-        Build Claude API prompt string with strategy-specific instructions.
+        Build prompt string for Claude API call.
+        SYNCHRONOUS METHOD - string construction only
         
         Args:
             analysis: TurnAnalysis object
-            context: SessionContext object
-            strategy: Selected CoachingStrategy
+            context: SessionContext for history
+            strategy: Selected strategy for prompt customization
             
         Returns:
-            Complete prompt string for Claude API
+            Complete prompt string for Claude
             
-        Includes:
+        Content:
             - Student transcript
-            - Debate topic and position
             - Strategy-specific instructions
-            - Response format requirements (1-3 sentences, no bullets)
-            - Last 3 coaching history entries
+            - Debate topic and position
+            - Last 3 turns of coaching history
+            - Response format requirements (1-3 sentences, no bullet points)
         """
         transcript = getattr(analysis.turn_input, 'transcript', '') if hasattr(analysis, 'turn_input') else ''
         
-        base_prompt = f"""You are an AI debate partner coaching a Chinese L2 English learner. 
+        base_prompt = f"""You are debating with a Chinese student learning English. The topic is: "{context.topic}"
+They are arguing {context.user_position}. Their last statement: "{transcript}"
 
-Debate topic: {context.topic}
-Student's position: {context.user_position}
-Student said: "{transcript}"
-
-Recent coaching history: {self._get_recent_strategies(context, 3)}
-
-Strategy: {strategy.value}
-
-"""
+Your role is to be their debate PARTNER, not teacher. Never say "Good job!" or "You need to improve."
+Engage with their argument naturally."""
         
         strategy_instructions = {
-            CoachingStrategy.PROBE: "Ask a follow-up question to draw out more reasoning. Be curious about their thinking.",
-            CoachingStrategy.CHALLENGE: "Push back on their claim with a counterargument. Take the opposing side clearly but not aggressively.",
-            CoachingStrategy.REDIRECT: "Steer them back on topic. Ask a question that connects to the main debate.",
-            CoachingStrategy.PRAISE_AND_PUSH: "Acknowledge their strong point then raise the bar with a deeper question.",
-            CoachingStrategy.CORRECT_PRONUNCIATION: f"Model correct pronunciation of '{self._get_pronunciation_target(analysis)}' naturally in your response."
+            CoachingStrategy.PROBE: "Ask a follow-up question to draw out more reasoning from their argument.",
+            CoachingStrategy.CHALLENGE: "Push back on their claim with a reasonable counterargument from the opposing side.",
+            CoachingStrategy.REDIRECT: "Steer them back on topic with a relevant question about the main debate issue.",
+            CoachingStrategy.PRAISE_AND_PUSH: "Acknowledge their strong point briefly, then raise the bar with a tougher question.",
+            CoachingStrategy.CORRECT_PRONUNCIATION: "Model correct pronunciation by naturally using the mispronounced word in your response."
         }
         
-        instruction = strategy_instructions.get(strategy, "Ask a follow-up question.")
+        strategy_instruction = strategy_instructions.get(strategy, "Ask a thoughtful follow-up question.")
         
-        return base_prompt + f"""{instruction}
+        recent_history = ""
+        if len(context.coaching_history) > 0:
+            recent_strategies = context.coaching_history[-3:]
+            recent_history = f"\nRecent coaching approaches used: {[s.value for s in recent_strategies]}. Vary your approach."
+        
+        return f"""{base_prompt}
 
-Respond in 1-3 sentences. Be conversational like a debate partner, not a teacher. No bullet points. No "Good job!" or "You need to improve." Engage with the argument itself."""
+Strategy: {strategy_instruction}{recent_history}
 
+Respond in 1-3 sentences. Be conversational and natural. No bullet points or markdown formatting."""
+    
+    def _create_default_action(self, context: SessionContext) -> CoachingAction:
+        """
+        Create fallback CoachingAction for error cases.
+        SYNCHRONOUS METHOD - no external calls
+        
+        Args:
+            context: SessionContext for topic-relevant question
+            
+        Returns:
+            CoachingAction with strategy=PROBE and generic opening question
+        """
+        response_text = f"What's your main argument about {context.topic}?"
+        
+        return CoachingAction(
+            strategy=CoachingStrategy.PROBE,
+            response_text=response_text,
+            internal_reason="Default action for error case or empty transcript",
+            target_word="",
+            difficulty_delta=0
+        )
+    
     def _calculate_difficulty_delta(self, context: SessionContext) -> int:
         """
         Calculate difficulty adjustment based on recent performance.
+        SYNCHRONOUS METHOD - pure calculation
         
         Args:
             context: SessionContext with argument_scores history
             
         Returns:
-            int: -1 (easier), 0 (same), +1 (harder)
+            -1 (easier), 0 (same), or +1 (harder)
             
         Logic:
             +1 if last 2 argument_scores >= 0.7
@@ -303,123 +312,105 @@ Respond in 1-3 sentences. Be conversational like a debate partner, not a teacher
         if len(context.argument_scores) < 2:
             return 0
         
-        last_two = context.argument_scores[-2:]
+        last_two_scores = context.argument_scores[-2:]
         
-        if all(score >= self.STRONG_ARGUMENT_THRESHOLD for score in last_two):
+        if all(score >= HIGH_ARGUMENT_THRESHOLD for score in last_two_scores):
             return 1
-        elif all(score < self.WEAK_ARGUMENT_THRESHOLD for score in last_two):
+        elif all(score < DIFFICULTY_THRESHOLD for score in last_two_scores):
             return -1
         else:
             return 0
-
-    def _should_skip_strategy(self, strategy: CoachingStrategy, context: SessionContext) -> bool:
-        """
-        Check if strategy should be skipped due to recent usage.
-        
-        Args:
-            strategy: CoachingStrategy to check
-            context: SessionContext with coaching_history
-            
-        Returns:
-            bool: True if strategy was used in last 2 turns
-        """
-        if len(context.coaching_history) < 2:
-            return False
-        
-        return context.coaching_history[-2:] == [strategy, strategy]
-
-    def _get_pronunciation_target(self, analysis: TurnAnalysis) -> str:
+    
+    def _get_target_word(self, analysis: TurnAnalysis) -> str:
         """
         Extract target word for pronunciation correction.
+        SYNCHRONOUS METHOD - data extraction only
         
         Args:
-            analysis: TurnAnalysis object
+            analysis: TurnAnalysis with pronunciation data
             
         Returns:
-            str: First major mispronounced word, or "" if none
+            First mispronounced word with MAJOR severity, or "" if none
         """
-        if (hasattr(analysis, 'pronunciation') and 
-            hasattr(analysis.pronunciation, 'mispronounced_words')):
-            for word in analysis.pronunciation.mispronounced_words:
-                if getattr(word, 'severity', None) == 'MAJOR':
-                    return getattr(word, 'word', '')
+        if not hasattr(analysis, 'pronunciation') or not hasattr(analysis.pronunciation, 'mispronounced_words'):
+            return ""
+        
+        for word in analysis.pronunciation.mispronounced_words:
+            if hasattr(word, 'severity') and word.severity == 'MAJOR':
+                return getattr(word, 'word', "")
+        
         return ""
-
-    def _create_default_action(self, context: SessionContext) -> CoachingAction:
-        """
-        Create safe fallback CoachingAction.
-        
-        Args:
-            context: SessionContext for topic-relevant question
-            
-        Returns:
-            CoachingAction with strategy=PROBE and generic opening question
-        """
-        return CoachingAction(
-            strategy=CoachingStrategy.PROBE,
-            response_text=self._get_opening_question(context),
-            internal_reason="Default fallback action",
-            difficulty_delta=0
-        )
-
+    
     def _strip_markdown(self, text: str) -> str:
         """
-        Remove markdown formatting from text.
+        Remove markdown formatting from response text.
+        SYNCHRONOUS METHOD - regex processing
         
         Args:
-            text: Input text potentially containing markdown
+            text: Raw response from Claude
             
         Returns:
-            str: Text with markdown removed
+            Clean text with markdown removed
         """
-        # Remove markdown formatting
-        text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)  # Bold
-        text = re.sub(r'\*(.*?)\*', r'\1', text)      # Italic
-        text = re.sub(r'`(.*?)`', r'\1', text)        # Code
-        text = re.sub(r'#{1,6}\s+', '', text)         # Headers
-        text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)  # Links
+        # Remove bold and italic
+        text = re.sub(r'\*\*([^*]+)\*\*', r'\1', text)
+        text = re.sub(r'\*([^*]+)\*', r'\1', text)
+        text = re.sub(r'__([^_]+)__', r'\1', text)
+        text = re.sub(r'_([^_]+)_', r'\1', text)
+        
+        # Remove headers
+        text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+        
+        # Remove bullet points
+        text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)
+        
+        # Remove numbered lists
+        text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
+        
         return text.strip()
-
-    def _is_off_topic(self, analysis: TurnAnalysis) -> bool:
+    
+    def _avoid_repetition(self, preferred_strategy: CoachingStrategy, context: SessionContext) -> CoachingStrategy:
         """
-        Determine if student response is off-topic.
+        Check if strategy was used in last 2 turns and return alternative.
+        SYNCHRONOUS METHOD - list processing
         
         Args:
-            analysis: TurnAnalysis object
-            
-        Returns:
-            bool: True if argument_score < 0.1 or transcript is empty
-        """
-        if not hasattr(analysis, 'turn_input') or not hasattr(analysis.turn_input, 'transcript'):
-            return True
-        
-        if not analysis.turn_input.transcript.strip():
-            return True
-        
-        argument_score = getattr(analysis, 'argument_score', 0.0) if hasattr(analysis, 'argument_score') else 0.0
-        return argument_score < self.OFF_TOPIC_THRESHOLD
-
-    def _get_recent_strategies(self, context: SessionContext, count: int = 3) -> List[CoachingStrategy]:
-        """
-        Get most recent coaching strategies from history.
-        
-        Args:
+            preferred_strategy: Strategy selected by main rules
             context: SessionContext with coaching_history
-            count: Number of recent strategies to return
             
         Returns:
-            List[CoachingStrategy]: Recent strategies (newest first)
+            Original strategy or alternative if repetition detected
         """
-        return context.coaching_history[-count:] if len(context.coaching_history) >= count else context.coaching_history
-
-    def _get_opening_question(self, context: SessionContext) -> str:
-        """Get appropriate opening question based on user position."""
-        return self.DEFAULT_OPENING_QUESTIONS.get(
-            context.user_position,
-            self.DEFAULT_OPENING_QUESTIONS["neutral"]
-        )
-
-    def _get_fallback_response(self, strategy: CoachingStrategy, context: SessionContext) -> str:
-        """Get fallback response when API call fails."""
-        fallbacks = {
-            CoachingStrategy.
+        if len(context.coaching_history) < REPEAT_PREVENTION_LOOKBACK:
+            return preferred_strategy
+        
+        last_two = context.coaching_history[-REPEAT_PREVENTION_LOOKBACK:]
+        if all(strategy == preferred_strategy for strategy in last_two):
+            # Find alternative strategy
+            alternatives = [
+                CoachingStrategy.PROBE,
+                CoachingStrategy.CHALLENGE,
+                CoachingStrategy.REDIRECT,
+                CoachingStrategy.PRAISE_AND_PUSH
+            ]
+            
+            for alt in alternatives:
+                if alt != preferred_strategy:
+                    return alt
+        
+        return preferred_strategy
+    
+    def _get_fallback_response(self, strategy: CoachingStrategy, context: SessionContext, analysis: TurnAnalysis = None) -> str:
+        """
+        Get fallback response when Claude API fails.
+        SYNCHRONOUS METHOD - string generation only
+        
+        Args:
+            strategy: Selected coaching strategy
+            context: Session context for topic reference
+            analysis: TurnAnalysis object for additional context
+            
+        Returns:
+            Appropriate fallback response text
+        """
+        fallback_responses =

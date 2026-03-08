@@ -159,6 +159,216 @@ Acceptance criteria:
 - Fallback response available for all strategies (no API required)
 """,
     },
+    "session_evaluator": {
+        "module_name": "session_evaluator.py",
+        "class_name": "SessionEvaluator",
+        "requirements": """
+The SessionEvaluator module generates a structured end-of-session coaching report
+for SpeakFlow AI, an English debate coaching platform for Chinese L2 learners.
+
+It is called once per debate session, after all turns have completed.
+It receives the full session history and uses Claude to produce a rich,
+personalised report across five dimensions.
+
+────────────────────────────────────────────────────────────────────────
+IMPORTS — use shared_types.py for all shared models
+────────────────────────────────────────────────────────────────────────
+from shared_types import (
+    SessionTurn, SessionMetadata,
+    CoachingStrategy, ArgumentResult, PronunciationResult,
+)
+
+Do NOT redefine TurnAnalysis, CoachingAction, SessionTurn, etc.
+Import them from shared_types. Only define new types in this module.
+
+────────────────────────────────────────────────────────────────────────
+DATA MODELS (new, defined in this module)
+────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ArgumentProgressReport:
+    opening_score: float            # argument_score of turn 1
+    closing_score: float            # argument_score of last turn
+    trend: str                      # "improving" | "declining" | "stable"
+    best_turn_number: int
+    best_turn_summary: str          # one sentence describing the best argument
+    recurring_gaps: List[str]       # logical gaps that appeared in 3+ turns
+    cre_completion_rate: float      # % of turns with all three: claim+reason+evidence
+
+@dataclass
+class PronunciationProgressReport:
+    opening_fluency: float          # fluency_score of turn 1
+    closing_fluency: float          # fluency_score of last turn
+    trend: str                      # "improving" | "declining" | "stable"
+    persistent_errors: List[str]    # words mispronounced in 3+ turns
+    resolved_errors: List[str]      # words that were errors early but correct later
+    target_phonemes: List[str]      # top 3 phonemes to practice (union of all turns)
+
+@dataclass
+class VocabularyReport:
+    overused_words: List[str]       # words used 4+ times across turns
+    strong_vocabulary: List[str]    # sophisticated words used correctly
+    suggested_alternatives: dict    # overused_word -> [alternative1, alternative2]
+
+@dataclass
+class CoachingEffectivenessReport:
+    strategy_counts: dict           # CoachingStrategy.value -> int
+    most_used_strategy: str
+    argument_response_to_probe: float    # avg score change after PROBE turns
+    argument_response_to_challenge: float  # avg score change after CHALLENGE turns
+
+@dataclass
+class SessionReport:
+    metadata: SessionMetadata
+    argument_progress: ArgumentProgressReport
+    pronunciation_progress: PronunciationProgressReport
+    vocabulary: VocabularyReport
+    coaching_effectiveness: CoachingEffectivenessReport
+    overall_summary: str            # 2-3 sentence holistic summary (Claude-generated)
+    top_strengths: List[str]        # 2 specific strengths, grounded in turn data
+    top_improvements: List[str]     # 2 specific actionable improvements
+    next_session_focus: str         # one concrete suggestion for next session
+    timestamp: datetime
+    latency_ms: int
+
+────────────────────────────────────────────────────────────────────────
+CORE CLASS
+────────────────────────────────────────────────────────────────────────
+
+class SessionEvaluator:
+
+    def __init__(self, anthropic_api_key: str):
+        Initialize with AsyncAnthropic client.
+        Set timeout on AsyncAnthropic() init — NOT inside messages.create().
+        Model: os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+
+    async def evaluate(
+        self,
+        turns: List[SessionTurn],
+        metadata: SessionMetadata,
+    ) -> SessionReport:
+        Main entry point. Returns SessionReport.
+        - Raise ValueError if turns is empty.
+        - Run _compute_stats() first (synchronous, no LLM).
+        - Then call _generate_narrative() for the Claude-generated fields.
+        - Combine into SessionReport.
+        - Measure and record latency_ms.
+        - On any exception: return _create_fallback_report(turns, metadata, start_time).
+
+    def _compute_stats(
+        self,
+        turns: List[SessionTurn],
+    ) -> dict:
+        Pure computation — NO LLM calls. Returns a flat dict of all numeric
+        and list-based stats that feed both the structured sub-reports and
+        the Claude prompt. Keys include:
+            argument_scores: List[float]
+            fluency_scores: List[float]
+            all_logical_gaps: List[str]          # flattened, with repetition
+            all_mispronounced_words: List[str]   # flattened, with repetition
+            all_vocabulary_flags: List[str]      # flattened, with repetition
+            strategy_sequence: List[str]         # CoachingStrategy.value per turn
+            cre_completions: int                 # turns where claim+reason+evidence all True
+            total_turns: int
+
+    async def _generate_narrative(
+        self,
+        turns: List[SessionTurn],
+        stats: dict,
+    ) -> dict:
+        Single Claude API call. Returns a dict with keys:
+            overall_summary: str
+            top_strengths: List[str]       (exactly 2 items)
+            top_improvements: List[str]    (exactly 2 items)
+            next_session_focus: str
+        Prompt must include: topic, user_position, total turns, argument trend,
+        fluency trend, recurring gaps, persistent pronunciation errors.
+        Instruct Claude to respond ONLY in JSON. No markdown fences.
+        Strip markdown fences before json.loads():
+            re.sub(r"```[a-z]*\n?|```", "", text).strip()
+        On any parse failure: return _default_narrative().
+
+    def _build_argument_progress(self, turns: List[SessionTurn], stats: dict) -> ArgumentProgressReport:
+        Synchronous. Compute from stats dict. No LLM.
+        trend logic: compare first-third vs last-third of argument_scores.
+            improving if avg(last third) - avg(first third) > 0.1
+            declining if avg(first third) - avg(last third) > 0.1
+            stable otherwise
+        recurring_gaps: gaps that appear in >= 3 turns (use Counter).
+
+    def _build_pronunciation_progress(self, turns: List[SessionTurn], stats: dict) -> PronunciationProgressReport:
+        Synchronous. Compute from stats dict. No LLM.
+        persistent_errors: words mispronounced in >= 3 turns.
+        resolved_errors: words mispronounced in turns 1-3 but NOT in last 3 turns.
+        target_phonemes: union of target_phonemes from all PronunciationResults, top 3 by frequency.
+
+    def _build_vocabulary_report(self, stats: dict) -> VocabularyReport:
+        Synchronous. Compute from stats dict. No LLM.
+        overused_words: vocabulary_flags appearing 4+ times (use Counter).
+        strong_vocabulary: vocabulary_flags that appear exactly once
+            AND word length > 6 (proxy for sophisticated vocabulary).
+        suggested_alternatives: hardcoded dict for top 10 common overused words.
+            e.g. {"think": ["argue", "contend", "maintain"],
+                  "bad": ["detrimental", "harmful", "counterproductive"], ...}
+            Only include keys that appear in overused_words.
+
+    def _build_coaching_effectiveness(self, turns: List[SessionTurn], stats: dict) -> CoachingEffectivenessReport:
+        Synchronous. Compute from stats dict. No LLM.
+        For argument_response_to_probe and argument_response_to_challenge:
+            find turns where that strategy was used, then compute
+            avg(argument_score[turn+1] - argument_score[turn]) for those turns.
+            Return 0.0 if no such turns exist.
+
+    def _create_fallback_report(
+        self,
+        turns: List[SessionTurn],
+        metadata: SessionMetadata,
+        start_time: float,
+    ) -> SessionReport:
+        Synchronous. Returns a minimal valid SessionReport with:
+        - All numeric scores computed from turns (no LLM)
+        - overall_summary = "Session analysis unavailable."
+        - top_strengths = [], top_improvements = [], next_session_focus = ""
+
+    def _default_narrative(self) -> dict:
+        Returns hardcoded fallback dict for _generate_narrative() parse failures.
+
+────────────────────────────────────────────────────────────────────────
+ANTHROPIC SDK PATTERN
+────────────────────────────────────────────────────────────────────────
+# In __init__:
+self.anthropic_client = AsyncAnthropic(
+    api_key=anthropic_api_key,
+    timeout=float(os.getenv("ANTHROPIC_TIMEOUT_SECONDS", "30")),
+)
+self.model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+
+# In _generate_narrative:
+response = await self.anthropic_client.messages.create(
+    model=self.model,
+    max_tokens=1000,
+    messages=[{"role": "user", "content": prompt}]
+)
+text = response.content[0].text
+text = re.sub(r"```[a-z]*\n?|```", "", text).strip()
+data = json.loads(text)
+
+────────────────────────────────────────────────────────────────────────
+ACCEPTANCE CRITERIA
+────────────────────────────────────────────────────────────────────────
+- evaluate() raises ValueError when turns=[]
+- evaluate() returns SessionReport within 10 seconds for a 10-turn session
+- argument_progress.trend == "improving" when scores go 0.3 → 0.8 across turns
+- argument_progress.trend == "stable"    when scores stay within ±0.1
+- pronunciation_progress.persistent_errors contains only words seen in 3+ turns
+- vocabulary.overused_words contains only words flagged 4+ times
+- on Anthropic API failure: returns fallback report, no exception raised
+- overall_summary, top_strengths, top_improvements, next_session_focus
+  are non-empty strings in the normal path
+- latency_ms is recorded and present in the returned SessionReport
+- Strip markdown fences before json.loads() — never call json.loads() on raw API text
+""",
+    },
 }
 
 

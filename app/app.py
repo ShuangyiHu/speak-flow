@@ -15,7 +15,7 @@ class SpeakFlowUI:
     def analyze_audio(self, audio_file, topic, user_position):
         """Analyze audio input and return all feedback components"""
         if audio_file is None:
-            return "", False, False, False, 0, "", ""
+            return "", False, False, False, 0, "", "", ""
         
         # Mock transcript for demo
         transcript = "I think renewable energy is the key to solving climate change because it reduces carbon emissions."
@@ -48,7 +48,6 @@ class SpeakFlowUI:
         )
         
         try:
-            # Run async function
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             response = loop.run_until_complete(
@@ -97,9 +96,10 @@ def create_interface():
                 )
                 
                 gr.Markdown("### Record Your Argument")
+                # Gradio 4.x: 'source' replaced by 'sources' (list)
                 audio_input = gr.Audio(
                     label="Record Audio",
-                    source="microphone",
+                    sources=["microphone"],
                     type="filepath"
                 )
                 

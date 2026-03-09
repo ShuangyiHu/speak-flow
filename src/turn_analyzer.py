@@ -5,65 +5,20 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
 from typing import List, Optional
 
 from anthropic import AsyncAnthropic
 
-
-@dataclass
-class TurnInput:
-    transcript: str
-    session_id: str
-    turn_number: int
-    topic: str
-    user_position: str  # "for" or "against"
-    audio_path: str
-    prior_turns: List[str]
-
-
-@dataclass
-class ArgumentResult:
-    has_claim: bool
-    has_reasoning: bool
-    has_evidence: bool
-    logical_gaps: List[str]
-    vocabulary_flags: List[str]
-    argument_score: float  # 0.0 to 1.0
-    summary: str
-
-
-class ErrorSeverity(Enum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
-
-@dataclass
-class WordError:
-    word: str
-    expected_ipa: str
-    actual_ipa: str
-    severity: ErrorSeverity
-
-
-@dataclass
-class PronunciationResult:
-    mispronounced_words: List[WordError]
-    fluency_score: float  # 0.0 to 1.0
-    target_phonemes: List[str]  # Phonemes to focus on for improvement
-
-
-@dataclass
-class TurnAnalysis:
-    turn_input: TurnInput
-    argument: ArgumentResult
-    pronunciation: PronunciationResult
-    timestamp: datetime
-    latency_ms: int
-
+from shared_types import (
+    TurnInput,
+    ArgumentResult,
+    ErrorSeverity,
+    WordError,
+    PronunciationResult,
+    TurnAnalysis,
+    TurnIntent,
+)
 
 # Configuration constants
 ANTHROPIC_MODEL = "claude-sonnet-4-5"
@@ -156,8 +111,11 @@ class TurnAnalyzer:
         try:
             response = await self.anthropic_client.messages.create(
                 model=ANTHROPIC_MODEL,
-                max_tokens=1000,
-                temperature=0.1,
+                max_tokens=2048,
+                system=(
+                    "You are a JSON-only API. You must respond with valid JSON and nothing else. "
+                    "No markdown, no explanation, no code fences. Only a single JSON object."
+                ),
                 messages=[{
                     "role": "user",
                     "content": prompt
@@ -234,79 +192,187 @@ class TurnAnalyzer:
             return self._create_default_pronunciation_result()
 
     def _build_argument_analysis_prompt(self, turn_input: TurnInput) -> str:
-        """
-        Build Claude prompt for argument analysis.
-        
-        Args:
-            turn_input: Input containing transcript and debate context
-            
-        Returns:
-            str: Formatted prompt for Claude API
-        """
-        prior_context = "\n".join(turn_input.prior_turns[-3:]) if turn_input.prior_turns else "None"
-        
-        return f"""
-Analyze this English debate turn using the Claim-Reason-Evidence framework.
+        """Build prompt for 4-dimension argument analysis."""
+        prior_context = ""
+        if turn_input.prior_turns:
+            last = turn_input.prior_turns[-1]
+            prior_context = f"\nPrevious turn summary: {last.get('summary', '')}"
 
-CONTEXT:
+        return f"""Analyze this English debate statement from a Chinese L2 learner.
+
 Topic: {turn_input.topic}
-User Position: {turn_input.user_position}
-Turn Number: {turn_input.turn_number}
-Previous Turns: {prior_context}
+Position: {turn_input.user_position}
+Turn: {turn_input.turn_number}{prior_context}
 
-TRANSCRIPT TO ANALYZE:
-{turn_input.transcript}
+Student said: "{turn_input.transcript}"
 
-ANALYSIS REQUIRED:
-1. Has Clear Claim: Does this contain a clear position statement? (not questions or off-topic remarks)
-2. Has Reasoning: Does this provide logical reasoning to support the claim?
-3. Has Evidence: Does this include specific examples, data, or expert citations?
-4. Logical Gaps: What logical weaknesses or gaps exist?
-5. Vocabulary Flags: Any inappropriate/informal language for academic debate?
-6. Argument Score: Rate 0.0-1.0 based on CRE framework completeness
-7. Summary: One sentence summary of the argument's strength
+Score on FOUR dimensions (each 0.0–1.0). Be GENEROUS — this is a language learner, not a competitive debater.
 
-Respond in this exact JSON format:
+1. CLARITY (Has the student clearly stated their position and main point?)
+   1.0 = Position crystal clear, sentences complete and well-structured
+   0.7 = Position clear, minor grammatical issues
+   0.4 = Position somewhat clear but hard to follow
+   0.1 = Very unclear or off-topic
+
+2. REASONING (Has the student given logical reasons to support their claim?)
+   1.0 = Two or more well-connected reasons
+   0.7 = One solid reason with explanation
+   0.4 = Reason implied but not fully explained
+   0.1 = No reasoning given
+
+3. DEPTH (Has the student added any example, analogy, or real-world reference?)
+   1.0 = Specific example or real-world reference given
+   0.5 = Vague reference (e.g. "like many people say")
+   0.0 = No example or elaboration at all
+   NOTE: Personal experience and everyday examples count fully. Data not required.
+
+4. FLUENCY (Is the English natural, grammatically acceptable, and easy to follow?)
+   1.0 = Natural, mostly correct grammar, good connectives
+   0.7 = Understandable with a few errors
+   0.4 = Several errors that affect understanding
+   0.1 = Very hard to understand
+
+Weighted score = 0.3*clarity + 0.3*reasoning + 0.1*depth + 0.3*fluency
+
+Also identify:
+- has_claim: true if student stated a position
+- has_reasoning: true if at least one reason given
+- has_evidence: true if depth_score >= 0.4
+- logical_gaps: up to 2 items, max 8 words each
+- vocabulary_flags: informal or weak words used, max 3 items, max 5 words each
+- summary: ONE encouraging sentence (max 20 words) naming the strongest aspect and the one thing to improve next
+
+Output only this JSON, no extra text:
 {{
-    "has_claim": true/false,
-    "has_reasoning": true/false,
-    "has_evidence": true/false,
-    "logical_gaps": ["gap1", "gap2"],
-    "vocabulary_flags": ["word1", "word2"],
-    "argument_score": 0.75,
-    "summary": "Brief summary of argument quality"
-}}
-"""
+    "clarity_score": 0.0,
+    "reasoning_score": 0.0,
+    "depth_score": 0.0,
+    "fluency_score_arg": 0.0,
+    "argument_score": 0.0,
+    "has_claim": false,
+    "has_reasoning": false,
+    "has_evidence": false,
+    "logical_gaps": [],
+    "vocabulary_flags": [],
+    "clarity_feedback": "one short phrase",
+    "reasoning_feedback": "one short phrase",
+    "depth_feedback": "one short phrase",
+    "fluency_feedback": "one short phrase",
+    "summary": "one encouraging sentence"
+}}"""
+
+    def _detect_intent(self, transcript: str) -> TurnIntent:
+        """
+        Classify the student's input before scoring.
+        DEBATE_STATEMENT → normal scoring path
+        META_QUESTION    → student is asking the coach something
+        OFF_TOPIC        → too short or irrelevant
+        """
+        t = transcript.strip().lower()
+
+        if len(t.split()) < 4:
+            return TurnIntent.OFF_TOPIC
+
+        meta_phrases = [
+            # Asking for clarification
+            "what do you mean", "what did you mean", "could you clarify",
+            "can you explain", "what are you asking",
+            "what question", "what do you want",
+            # Pushing back — student says they already answered
+            "i already said", "i already stated", "i already mentioned",
+            "i just said", "i told you", "didn't i just", "didn't i already",
+            "i just gave", "i just provided", "i just told",
+            "i gave you", "i provided", "haven't i",
+            "don't understand the question",
+        ]
+        if any(p in t for p in meta_phrases) or (t.endswith("?") and len(t.split()) < 15):
+            return TurnIntent.META_QUESTION
+
+        return TurnIntent.DEBATE_STATEMENT
 
     def _parse_argument_response(self, response_text: str) -> ArgumentResult:
-        """
-        Parse Claude API response into ArgumentResult object.
-        
-        Args:
-            response_text: Raw JSON response from Claude
-            
-        Returns:
-            ArgumentResult: Parsed argument analysis
-        """
+        """Parse Claude API response into ArgumentResult. Uses regex fallback if JSON is malformed."""
+        logging.debug(f"Raw argument response: {response_text}")
+
+        # ── Attempt 1: clean and parse as JSON ───────────────────────────────
+        cleaned = re.sub(r"```(?:json)?\s*", "", response_text)
+        cleaned = re.sub(r"```", "", cleaned).strip()
+        json_start = cleaned.find('{')
+        json_end   = cleaned.rfind('}')
+        if json_start != -1 and json_end != -1:
+            candidate = cleaned[json_start:json_end + 1]
+            candidate = re.sub(r',\s*([}\]])', r'\1', candidate)
+            try:
+                data = json.loads(candidate)
+                clarity   = float(data.get("clarity_score",    0.0))
+                reasoning = float(data.get("reasoning_score",  0.0))
+                depth     = float(data.get("depth_score",      0.0))
+                fluency   = float(data.get("fluency_score_arg",0.0))
+                score     = round(0.3*clarity + 0.3*reasoning + 0.1*depth + 0.3*fluency, 3)
+                return ArgumentResult(
+                    clarity_score=clarity,
+                    reasoning_score=reasoning,
+                    depth_score=depth,
+                    fluency_score_arg=fluency,
+                    argument_score=data.get("argument_score", score),
+                    has_claim=bool(data.get("has_claim", False)),
+                    has_reasoning=bool(data.get("has_reasoning", False)),
+                    has_evidence=bool(data.get("has_evidence", depth >= 0.4)),
+                    logical_gaps=data.get("logical_gaps", []),
+                    vocabulary_flags=data.get("vocabulary_flags", []),
+                    summary=data.get("summary", "No analysis available"),
+                    clarity_feedback=data.get("clarity_feedback", ""),
+                    reasoning_feedback=data.get("reasoning_feedback", ""),
+                    depth_feedback=data.get("depth_feedback", ""),
+                    fluency_feedback=data.get("fluency_feedback", ""),
+                )
+            except json.JSONDecodeError as e:
+                logging.warning(f"JSON parse failed ({e}), trying field-by-field extraction")
+
+        # ── Attempt 2: regex field-by-field extraction ────────────────────────
         try:
-            response_text = re.sub(r"```json|```", "", response_text).strip()
-            data = json.loads(response_text)
-            
+            def extract_bool(field: str) -> bool:
+                m = re.search(rf'"{field}"\s*:\s*(true|false)', response_text, re.IGNORECASE)
+                return m.group(1).lower() == "true" if m else False
+
+            def extract_float(field: str) -> float:
+                m = re.search(rf'"{field}"\s*:\s*([0-9.]+)', response_text)
+                return float(m.group(1)) if m else DEFAULT_ARGUMENT_SCORE
+
+            def extract_str(field: str) -> str:
+                m = re.search(rf'"{field}"\s*:\s*"([^"]*)"', response_text)
+                return m.group(1) if m else "No analysis available"
+
+            def extract_list(field: str) -> list:
+                m = re.search(rf'"{field}"\s*:\s*\[([^\]]*)\]', response_text, re.DOTALL)
+                if not m:
+                    return []
+                return re.findall(r'"([^"]*)"', m.group(1))
+
+            logging.info("Using field-by-field extraction fallback")
+            clarity   = extract_float("clarity_score")
+            reasoning = extract_float("reasoning_score")
+            depth     = extract_float("depth_score")
+            fluency   = extract_float("fluency_score_arg")
             return ArgumentResult(
-                has_claim=data.get("has_claim", False),
-                has_reasoning=data.get("has_reasoning", False),
-                has_evidence=data.get("has_evidence", False),
-                logical_gaps=data.get("logical_gaps", []),
-                vocabulary_flags=data.get("vocabulary_flags", []),
-                argument_score=float(data.get("argument_score", DEFAULT_ARGUMENT_SCORE)),
-                summary=data.get("summary", "No analysis available")
+                clarity_score=clarity,
+                reasoning_score=reasoning,
+                depth_score=depth,
+                fluency_score_arg=fluency,
+                argument_score=round(0.3*clarity + 0.3*reasoning + 0.1*depth + 0.3*fluency, 3),
+                has_claim=extract_bool("has_claim"),
+                has_reasoning=extract_bool("has_reasoning"),
+                has_evidence=depth >= 0.4,
+                logical_gaps=extract_list("logical_gaps"),
+                vocabulary_flags=extract_list("vocabulary_flags"),
+                summary=extract_str("summary"),
+                clarity_feedback=extract_str("clarity_feedback"),
+                reasoning_feedback=extract_str("reasoning_feedback"),
+                depth_feedback=extract_str("depth_feedback"),
+                fluency_feedback=extract_str("fluency_feedback"),
             )
-            
-        except json.JSONDecodeError as e:
-            logging.error(f"Failed to parse JSON response from Anthropic API: {e}")
-            return self._create_default_argument_result()
-        except (KeyError, ValueError) as e:
-            logging.error(f"Invalid data format in Anthropic API response: {e}")
+        except Exception as e:
+            logging.error(f"Field-by-field extraction also failed: {e}")
             return self._create_default_argument_result()
 
     def _parse_mfa_output(self, mfa_output: str, transcript: str) -> PronunciationResult:
@@ -401,13 +467,21 @@ Respond in this exact JSON format:
     def _create_default_argument_result(self) -> ArgumentResult:
         """Create default ArgumentResult for error cases."""
         return ArgumentResult(
+            clarity_score=0.0,
+            reasoning_score=0.0,
+            depth_score=0.0,
+            fluency_score_arg=0.0,
+            argument_score=0.0,
             has_claim=False,
             has_reasoning=False,
             has_evidence=False,
             logical_gaps=[],
             vocabulary_flags=[],
-            argument_score=DEFAULT_ARGUMENT_SCORE,
-            summary="Analysis unavailable"
+            summary="Analysis unavailable",
+            clarity_feedback="",
+            reasoning_feedback="",
+            depth_feedback="",
+            fluency_feedback="",
         )
 
     def _create_default_pronunciation_result(self) -> PronunciationResult:
@@ -419,5 +493,13 @@ Respond in this exact JSON format:
         )
 
     def _create_empty_analysis(self, turn_input: TurnInput, start_time: float) -> TurnAnalysis:
-        """Create TurnAnalysis for empty transcript."""
-        end_time = time.time
+        """Create TurnAnalysis for empty transcript or error fallback."""
+        end_time = time.time()
+        latency_ms = int((end_time - start_time) * 1000)
+        return TurnAnalysis(
+            turn_input=turn_input,
+            argument=self._create_default_argument_result(),
+            pronunciation=self._create_default_pronunciation_result(),
+            timestamp=datetime.now(),
+            latency_ms=latency_ms,
+        )

@@ -204,63 +204,33 @@ class RAGRetriever:
         )
 
     async def _generate_hypothetical_query(
-        self,
-        coaching_action: CoachingAction,
-        turn_analysis: TurnAnalysis,
-    ) -> str:
+    self,
+    coaching_action: CoachingAction,
+    turn_analysis: TurnAnalysis,
+) -> str:
         """
-        Generate ideal argument version using HyDE technique.
-        
-        Args:
-            coaching_action: Contains topic and user_position
-            turn_analysis: Contains argument.summary and argument.logical_gaps
-        
-        Returns:
-            2-sentence hypothetical strong argument string
-        
-        Prompt template:
-            f"Write a 2-sentence strong debate argument on the topic: '{coaching_action.topic}'. "
-            f"Position: {coaching_action.user_position}. "
-            f"The student's current argument summary: '{turn_analysis.argument.summary}'. "
-            f"Their identified weaknesses: {turn_analysis.argument.logical_gaps}. "
-            f"Write the ideal version of this argument that fixes those weaknesses. "
-            f"Return only the 2-sentence argument, no preamble."
-        
-        Uses:
-            - AsyncAnthropic with model from ANTHROPIC_MODEL env var
-            - asyncio.wait_for with HYDE_TIMEOUT_SECONDS
-            - Fallback to coaching_action.topic on failure
-            - Strip markdown fences: re.sub(r"```[a-z]*\n?|```", "", text).strip()
+        OPT-1: HyDE query via template string — no Claude API call.
+        Original approach added ~2s per turn via Claude API.
         """
-        try:
-            prompt = (
-                f"Write a 2-sentence strong debate argument on the topic: '{coaching_action.topic}'. "
-                f"Position: {coaching_action.user_position}. "
-                f"The student's current argument summary: '{turn_analysis.argument.summary}'. "
-                f"Their identified weaknesses: {turn_analysis.argument.logical_gaps}. "
-                f"Write the ideal version of this argument that fixes those weaknesses. "
-                f"Return only the 2-sentence argument, no preamble."
+        topic    = coaching_action.topic or "social media"
+        position = coaching_action.user_position or "for"
+        summary  = (turn_analysis.argument.summary or "").strip()
+
+        if summary:
+            query = (
+                f"{topic}. Taking the {position} position: {summary}. "
+                f"This position is supported by measurable evidence showing significant "
+                f"societal impact on vulnerable populations and long-term consequences."
             )
-            
-            model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
-            
-            response = await asyncio.wait_for(
-                self._anthropic.messages.create(
-                    model=model,
-                    max_tokens=200,
-                    messages=[{"role": "user", "content": prompt}]
-                ),
-                timeout=HYDE_TIMEOUT_SECONDS
+        else:
+            query = (
+                f"{topic}. The {position} position is well-supported: "
+                f"empirical research demonstrates clear causal links between this issue "
+                f"and harmful outcomes for individuals and society."
             )
-            
-            content = response.content[0].text
-            # Strip markdown fences
-            content = re.sub(r"```[a-z]*\n?|```", "", content).strip()
-            return content
-            
-        except Exception as e:
-            logger.error(f"HyDE generation failed: {e}")
-            return coaching_action.topic
+
+        logger.info(f"[HyDE-template] query='{query[:100]}'")
+        return query
 
     def _embed(self, text: str) -> List[float]:
         """

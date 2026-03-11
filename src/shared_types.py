@@ -192,6 +192,8 @@ class ResponseRequest:
     user_position: str
     prior_responses: List[str]          # Last 3 coach response texts (repetition avoidance)
     turn_number: int
+    retrieval_context: Optional["RetrievalContext"] = None
+
 
 
 @dataclass

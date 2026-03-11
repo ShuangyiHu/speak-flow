@@ -41,13 +41,31 @@ API_TIMEOUT_SECONDS = 30.0
 MAX_RESPONSE_TIME_SECONDS = 25.0
 
 
+def _build_rag_section(retrieval_context) -> str:
+    """
+    Format retrieved debate chunks into a prompt section.
+    Returns empty string if no retrieval context available,
+    so prompt is identical to before when RAG is not used.
+    """
+    if retrieval_context is None or not retrieval_context.chunks:
+        return ""
+
+    lines = [
+        "",
+        "Relevant debate knowledge (use these to make your response more specific and grounded):",
+    ]
+    for i, chunk in enumerate(retrieval_context.chunks[:2], 1):
+        lines.append(f"  [{i}] ({chunk.argument_type}) {chunk.text}")
+    lines.append(
+        "Draw on the above naturally — do NOT quote verbatim or say 'according to'."
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
 class ResponseGenerator:
     def __init__(self):
-        """Initialize ResponseGenerator with Anthropic client.
-        
-        - Sets up AsyncAnthropic client with timeout from environment
-        - Configures model from ANTHROPIC_MODEL env var or default
-        """
+        """Initialize ResponseGenerator with Anthropic client."""
         self._client = AsyncAnthropic(
             api_key=os.getenv("ANTHROPIC_API_KEY"),
             timeout=API_TIMEOUT_SECONDS
@@ -55,38 +73,30 @@ class ResponseGenerator:
         self._model = os.getenv("ANTHROPIC_MODEL", DEFAULT_MODEL)
 
     async def generate_response(self, request: ResponseRequest) -> GeneratedResponse:
-        """Generate a natural debate partner response from coaching action.
-        
-        Args:
-            request: ResponseRequest containing coaching action and context
-            
-        Returns:
-            GeneratedResponse with natural language text, tone, and metadata
-            
-        Raises:
-            ValueError: If request is invalid
-            TimeoutError: If generation exceeds 2 seconds
-        """
+        """Generate a natural debate partner response from coaching action."""
         if not request.coaching_action:
             raise ValueError("Request must include coaching_action")
-        
+
         if not request.topic or not request.topic.strip():
             raise ValueError("Request must include non-empty topic")
-        
+
         if not request.user_position or not request.user_position.strip():
             raise ValueError("Request must include non-empty user_position")
-        
+
         strategy = request.coaching_action.strategy
         tone = STRATEGY_TONE_MAPPING.get(strategy, ToneMode.SOCRATIC)
-        
+
+        # Pull retrieval_context off request if present (optional field)
+        retrieval_context = getattr(request, "retrieval_context", None)
+
         try:
             async with asyncio.timeout(MAX_RESPONSE_TIME_SECONDS):
-                prompt = self._build_generation_prompt(request, tone)
+                prompt = self._build_generation_prompt(request, tone, retrieval_context)
                 raw_response = await self._call_anthropic_api(prompt)
                 parsed = self._parse_claude_response(raw_response)
                 text = parsed.get("text", "")
-                
-                # If repetitive or empty, retry once with explicit variation instruction
+
+                # If repetitive or empty, retry once
                 if not text or self._check_repetition(text, request.prior_responses):
                     varied_prompt = prompt + (
                         "\n\nIMPORTANT: Your previous response was too similar to a prior one. "
@@ -95,24 +105,23 @@ class ResponseGenerator:
                     raw_response = await self._call_anthropic_api(varied_prompt)
                     parsed = self._parse_claude_response(raw_response)
                     text = parsed.get("text", "")
-                
+
                 if not text:
                     return self._create_fallback_response(strategy, tone)
 
                 follow_up = parsed.get("follow_up_prompt")
-                now = datetime.now()
                 return GeneratedResponse(
                     text=text,
                     strategy_used=strategy,
                     tone=tone,
                     follow_up_prompt=follow_up,
                     estimated_speaking_seconds=self._estimate_speaking_time(text),
-                    timestamp=now,
+                    timestamp=datetime.now(),
                     latency_ms=0,
                 )
         except asyncio.TimeoutError:
             return self._create_fallback_response(strategy, tone)
-        except (anthropic.APIError, anthropic.APITimeoutError) as e:
+        except (anthropic.APIError, anthropic.APITimeoutError):
             return self._create_fallback_response(strategy, tone)
 
     async def generate_improved_version(
@@ -122,16 +131,7 @@ class ResponseGenerator:
         user_position: str,
         vocabulary_flags: list,
     ) -> str:
-        """
-        Generate a lightly improved version of the student's own words.
-        - Fixes grammar errors
-        - Replaces informal/weak vocabulary with more academic alternatives
-        - Adds a brief evidence phrase if missing
-        - Keeps the same argument structure and core ideas (no full rewrite)
-        - Written for Chinese L2 English learners
-
-        Returns improved transcript as plain text, or fallback on error.
-        """
+        """Generate a lightly improved version of the student's own words."""
         flags_str = ", ".join(vocabulary_flags) if vocabulary_flags else "none"
 
         prompt = f"""You are a language coach helping a Chinese student improve their English debate skills.
@@ -161,7 +161,7 @@ STRICT RULES  -  you must follow all of these:
                 raw = await self._call_anthropic_api(prompt)
                 return raw.strip()
         except Exception:
-            return ""  # caller will hide the box if empty
+            return ""
 
     async def generate_language_tips(
         self,
@@ -201,10 +201,7 @@ STRICT RULES  -  you must follow all of these:
         transcripts: list,
         argument_scores: list,
     ) -> str:
-        """
-        End-of-session debate summary: overall argument quality, strengths, one improvement tip.
-        Focused on debate content — not language.
-        """
+        """End-of-session debate summary."""
         turns_text = "\n".join(
             f"Turn {i+1} (score {argument_scores[i]:.2f}): {t}"
             for i, t in enumerate(transcripts)
@@ -240,10 +237,7 @@ STRICT RULES  -  you must follow all of these:
         transcripts: list,
         per_turn_tips: list,
     ) -> str:
-        """
-        End-of-session language summary: patterns across all turns, top 2 language habits to fix.
-        Focused purely on language — not debate content.
-        """
+        """End-of-session language summary."""
         turns_text = "\n".join(
             f"Turn {i+1}: {t}" for i, t in enumerate(transcripts)
         )
@@ -276,17 +270,7 @@ STRICT RULES  -  you must follow all of these:
             return "Focus on using connectors like 'therefore' and 'however' to link your ideas more clearly."
 
     async def _call_anthropic_api(self, prompt: str) -> str:
-        """Call Anthropic API to generate response text.
-        
-        Args:
-            prompt: Formatted prompt for Claude
-            
-        Returns:
-            Raw response text from Claude
-            
-        Raises:
-            Exception: Any API-related errors
-        """
+        """Call Anthropic API to generate response text."""
         message = await self._client.messages.create(
             model=self._model,
             max_tokens=200,
@@ -294,14 +278,19 @@ STRICT RULES  -  you must follow all of these:
         )
         return message.content[0].text
 
-    def _build_generation_prompt(self, request: ResponseRequest, tone: ToneMode) -> str:
-        """Build prompt for Claude based on request and tone."""
+    def _build_generation_prompt(
+        self,
+        request: ResponseRequest,
+        tone: ToneMode,
+        retrieval_context=None,
+    ) -> str:
+        """Build prompt for Claude — RAG-aware."""
         prior_text = " | ".join(request.prior_responses[-3:]) if request.prior_responses else "None"
         intent = request.coaching_action.intent or ""
         strategy_key = request.coaching_action.strategy.value
         turn = request.turn_number
 
-        # After turn 3, do a wrap-up  -  don't keep probing
+        # After turn 3, wrap-up branch (no RAG injection — keep it clean)
         if turn >= 3:
             return (
                 f'You are an English debate coach giving a warm round wrap-up.\n\n'
@@ -347,13 +336,17 @@ STRICT RULES  -  you must follow all of these:
         }
         instruction = strategy_instructions.get(strategy_key, strategy_instructions["PROBE"])
 
+        # ── RAG injection ──────────────────────────────────────────────────────
+        rag_section = _build_rag_section(retrieval_context)
+        # ──────────────────────────────────────────────────────────────────────
+
         return f"""You are an English debate coach having a real conversation with a student.
 
 Context:
 {intent}
 
 Your task ({strategy_key}): {instruction}
-
+{rag_section}
 Rules:
 - 2-3 sentences maximum, under 65 words total
 - Be specific to THIS student's exact words  -  never be generic
@@ -364,42 +357,18 @@ Rules:
 Output JSON only: {{"text": "your response"}}"""
 
     def _parse_claude_response(self, raw_response: str) -> Dict[str, Any]:
-        """Parse Claude's JSON response, handling markdown fences.
-        
-        Args:
-            raw_response: Raw text from Claude API
-            
-        Returns:
-            Parsed JSON dict
-            
-        Raises:
-            json.JSONDecodeError: If response isn't valid JSON
-        """
+        """Parse Claude's JSON response, handling markdown fences."""
         cleaned = raw_response.strip()
-        
-        # Remove outer markdown fences with improved pattern
         cleaned = re.sub(r'^```(?:json)?\s*', '', cleaned, flags=re.MULTILINE)
         cleaned = re.sub(r'\s*```\s*$', '', cleaned, flags=re.MULTILINE)
-        
-        # Handle nested backticks by finding the JSON boundaries
         json_start = cleaned.find('{')
         json_end = cleaned.rfind('}')
-        
         if json_start >= 0 and json_end > json_start:
             cleaned = cleaned[json_start:json_end + 1]
-        
         return json.loads(cleaned.strip())
 
     def _create_fallback_response(self, strategy: CoachingStrategy, tone: ToneMode) -> GeneratedResponse:
-        """Create fallback response when API fails.
-        
-        Args:
-            strategy: Coaching strategy for fallback selection
-            tone: Tone mode for the response
-            
-        Returns:
-            GeneratedResponse using predefined fallback text
-        """
+        """Create fallback response when API fails."""
         text = FALLBACK_RESPONSES.get(strategy, "What are your thoughts on that?")
         return GeneratedResponse(
             text=text,
@@ -412,39 +381,20 @@ Output JSON only: {{"text": "your response"}}"""
         )
 
     def _estimate_speaking_time(self, text: str) -> float:
-        """Estimate speaking duration for response text.
-        
-        Args:
-            text: Response text to analyze
-            
-        Returns:
-            Estimated speaking time in seconds
-        """
-        word_count = len(text.split())
-        return word_count / ESTIMATED_WORDS_PER_SECOND
+        """Estimate speaking duration for response text."""
+        return len(text.split()) / ESTIMATED_WORDS_PER_SECOND
 
     def _check_repetition(self, new_text: str, prior_responses: List[str]) -> bool:
-        """Check if new response is too similar to recent responses.
-        
-        Args:
-            new_text: Candidate response text
-            prior_responses: Last 3 response texts
-            
-        Returns:
-            True if response is repetitive, False otherwise
-        """
+        """Check if new response is too similar to recent responses."""
         if not prior_responses:
             return False
-            
         new_words = set(new_text.lower().split())
         if not new_words:
             return True
-            
         for prior in prior_responses:
             prior_words = set(prior.lower().split())
             if not prior_words:
                 continue
-                
             overlap = len(new_words & prior_words)
             total = len(new_words | prior_words)
             if total > 0 and overlap / total > 0.7:

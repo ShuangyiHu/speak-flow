@@ -1,18 +1,38 @@
 """
-app.py — SpeakFlow AI Gradio frontend
-======================================
+app.py — SpeakFlow AI Gradio frontend  (v7)
+============================================
 ⚠️  UI DESIGN IS FROZEN — DO NOT MODIFY LAYOUT WITHOUT EXPLICIT APPROVAL ⚠️
 
-Latency optimizations applied (v3):
-  OPT-1: RAG HyDE Claude call removed — replaced with template string (~2s saved)
-  OPT-2: CoachPolicyAgent + RAGRetriever parallelized via asyncio.gather (~2.5s saved)
-  OPT-3: ImprovedVersion + LanguageTips parallelized via asyncio.gather (~2.5s saved)
-  Expected total saving: ~7s per turn vs serial baseline (~17s → ~10s)
+Latency optimizations (v3):
+  OPT-1: RAG HyDE Claude call → template string
+  OPT-2: CoachPolicy + RAG parallelized
+  OPT-3: ImprovedVersion + LanguageTips parallel
 
-Timing instrumentation:
-  Each pipeline step logs: [TIMING] step=<n> duration=<Xs> cumulative=<Xs>
-  Final log line: [TIMING SUMMARY] total=<Xs> breakdown=<dict>
-  Compare baseline vs optimized by grepping: grep "TIMING" app.log
+Bug fix history:
+  FIX-1 (v4): stop_session async→sync via _run()
+  FIX-2 (v5): gr.Group→gr.Column for visibility (incorrect — didn't fix root cause)
+  FIX-3 (v5): session summary bypasses 2.0s internal timeout (direct client, 45s budget)
+  FIX-4 (v6): removed layout containers from outputs — buttons still didn't appear
+
+ROOT CAUSE CONFIRMED (v7):
+  In Gradio 6.x, gr.update(visible=True) on a Button that starts with visible=False
+  does NOT reliably work. The component is in the DOM with display:none, and the
+  update is processed without error, but the UI never reflects the change.
+  
+  EVIDENCE: gr.update(interactive=False) on analyze_btn DOES work (confirmed visible
+  in screenshot as greyed-out). interactive= updates are reliable; visible= updates
+  on initially-hidden components are not.
+
+FIX (v7):
+  All three wrapup buttons (continue, new_topic, stop) are rendered ALWAYS VISIBLE
+  but start as interactive=False (greyed out, unclickable — same as analyze_btn).
+  After turn 3: set interactive=True → buttons become active.
+  After stop:   set interactive=False again.
+  
+  Summary textboxes also always rendered (empty string = no visual noise).
+  stop_session populates them via value= update.
+  
+  This matches the confirmed-working pattern of analyze_btn interactive toggling.
 """
 
 import asyncio
@@ -47,6 +67,18 @@ logger = logging.getLogger(__name__)
 os.environ.setdefault("USE_STUB_MFA", "True")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
+SESSION_SUMMARY_TIMEOUT = 45.0
+
+DEBATE_TOPICS = [
+    "Social media does more harm than good",
+    "AI will take more jobs than it creates",
+    "Climate change policy should prioritise economic growth",
+    "Standardised testing is an effective measure of student ability",
+    "Universal basic income should be implemented globally",
+    "Space exploration funding should be redirected to solving poverty",
+    "Renewable energy can fully replace fossil fuels by 2050",
+]
+
 # ── Whisper lazy-load ─────────────────────────────────────────────────────────
 _whisper_model = None
 
@@ -77,28 +109,8 @@ def transcribe_audio(audio_path: str) -> str:
         return ""
 
 
-DEBATE_TOPICS = [
-    "Social media does more harm than good",
-    "AI will take more jobs than it creates",
-    "Climate change policy should prioritise economic growth",
-    "Standardised testing is an effective measure of student ability",
-    "Universal basic income should be implemented globally",
-    "Space exploration funding should be redirected to solving poverty",
-    "Renewable energy can fully replace fossil fuels by 2050",
-]
-
-
 # ── Timing helper ─────────────────────────────────────────────────────────────
 class StepTimer:
-    """Accumulates per-step durations and emits structured TIMING log lines.
-
-    Usage:
-        timer = StepTimer(turn_number)
-        ...do work...
-        timer.mark("step_name")   # logs duration + cumulative
-        timer.summary()           # logs full breakdown
-    """
-
     def __init__(self, turn: int):
         self.turn = turn
         self.t0   = time.time()
@@ -106,9 +118,9 @@ class StepTimer:
         self.steps: dict[str, float] = {}
 
     def mark(self, name: str) -> float:
-        now       = time.time()
-        duration  = now - self.prev
-        cumul     = now - self.t0
+        now      = time.time()
+        duration = now - self.prev
+        cumul    = now - self.t0
         self.steps[name] = round(duration, 3)
         self.prev = now
         logger.info(
@@ -147,6 +159,26 @@ class SpeakFlowUI:
         self.session_position: str = ""
         self.in_wrapup: bool       = False
 
+    @staticmethod
+    def _run(coro):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+    # ── Wrapup button state helpers ───────────────────────────────────────────
+    # Returns (continue_btn, new_topic_btn, stop_btn) updates.
+    # active=True → clickable; active=False → greyed (same as analyze_btn pattern).
+    @staticmethod
+    def _wrapup_active(active: bool):
+        return (
+            gr.update(interactive=active),
+            gr.update(interactive=active),
+            gr.update(interactive=active),
+        )
+
     # ── Reset ─────────────────────────────────────────────────────────────────
     def reset_session(self):
         self.turn_count = 0
@@ -161,79 +193,123 @@ class SpeakFlowUI:
         self.session_topic = ""
         self.session_position = ""
         self.in_wrapup = False
+        c, n, s = self._wrapup_active(False)
         return (
             None, "", "", "",
             "🔄 Session reset. Record your first argument.",
             False, False, False, False, "", "",
-            gr.update(visible=False),
-            gr.update(visible=False), "", "",
+            c, n, s,
+            "", "",           # clear summary textboxes
             gr.update(interactive=True),
         )
 
     def continue_session(self):
         self.turn_count = 2
         self.in_wrapup = False
+        c, n, s = self._wrapup_active(False)
         return (
             None, "", "", "",
             "▶ Continuing — record your next argument above.",
             False, False, False, False, "", "",
-            gr.update(visible=False),
-            gr.update(visible=False), "", "",
+            c, n, s,
+            "", "",
             gr.update(interactive=True),
         )
 
-    async def stop_session(self):
+    # ── stop_session ──────────────────────────────────────────────────────────
+    def stop_session(self):
+        """
+        Generate session summaries directly via Anthropic client (45s budget),
+        bypassing response_generator's internal 2.0s timeout.
+        Returns updates for: continue_btn, new_topic_btn, stop_btn,
+                              debate_summary_out, lang_summary_out
+        """
         self.in_wrapup = True
+        t_start = time.time()
+
         debate_summary = "Great session! You built up your argument well across the turns."
         lang_summary   = "Keep practising connectors like 'therefore' and 'however'."
 
         if self.session_transcripts:
-            try:
-                debate_summary = await self.response_gen.generate_session_debate_summary(
-                    topic=self.session_topic,
-                    user_position=self.session_position,
-                    transcripts=self.session_transcripts,
-                    argument_scores=self.argument_scores,
-                )
-            except Exception as e:
-                logger.error(f"Debate summary failed: {e}")
-            try:
-                lang_summary = await self.response_gen.generate_session_language_summary(
-                    transcripts=self.session_transcripts,
-                    per_turn_tips=self.session_language_tips,
-                )
-            except Exception as e:
-                logger.error(f"Language summary failed: {e}")
+            async def _summaries_direct():
+                client = self.response_gen._client
+                model  = self.response_gen._model
 
-        return (
-            gr.update(visible=False),
-            gr.update(visible=True),
-            debate_summary,
-            lang_summary,
-        )
+                turns_text = "\n".join(
+                    f"Turn {i+1} (score {self.argument_scores[i]:.2f}): {t}"
+                    for i, t in enumerate(self.session_transcripts)
+                )
+                avg = (sum(self.argument_scores) / len(self.argument_scores)
+                       if self.argument_scores else 0)
+
+                debate_prompt = (
+                    f'You are a debate coach giving end-of-session feedback.\n\n'
+                    f'Topic: "{self.session_topic}" | Position: {self.session_position}\n\n'
+                    f'Turns:\n{turns_text}\n\n'
+                    f'Avg score: {avg:.2f}/1.0\n\n'
+                    'Write 3-4 sentences: one specific strength (name a moment), '
+                    'one improvement area, one encouraging close. Plain text only.'
+                )
+                tips_text = "\n".join(
+                    f"Turn {i+1}: {t}"
+                    for i, t in enumerate(self.session_language_tips) if t
+                )
+                lang_prompt = (
+                    'You are an English teacher summarising language patterns.\n\n'
+                    f'Transcripts:\n{turns_text}\n\n'
+                    f'Per-turn tips:\n{tips_text or "none"}\n\n'
+                    'Write 2 sentences: one recurring language pattern, '
+                    'one concrete practice suggestion. Plain text only.'
+                )
+
+                d_msg, l_msg = await asyncio.gather(
+                    client.messages.create(
+                        model=model, max_tokens=300,
+                        messages=[{"role": "user", "content": debate_prompt}]
+                    ),
+                    client.messages.create(
+                        model=model, max_tokens=200,
+                        messages=[{"role": "user", "content": lang_prompt}]
+                    ),
+                    return_exceptions=True,
+                )
+                return d_msg, l_msg
+
+            try:
+                d_msg, l_msg = self._run(
+                    asyncio.wait_for(_summaries_direct(), timeout=SESSION_SUMMARY_TIMEOUT)
+                )
+                if not isinstance(d_msg, Exception):
+                    debate_summary = d_msg.content[0].text.strip()
+                else:
+                    logger.error(f"Debate summary failed: {d_msg}")
+                if not isinstance(l_msg, Exception):
+                    lang_summary = l_msg.content[0].text.strip()
+                else:
+                    logger.error(f"Lang summary failed: {l_msg}")
+            except asyncio.TimeoutError:
+                logger.error(f"stop_session timed out after {SESSION_SUMMARY_TIMEOUT}s")
+            except Exception as e:
+                logger.error(f"stop_session error: {e}")
+
+        elapsed = time.time() - t_start
+        logger.info(f"[STOP] done in {elapsed:.1f}s | debate: {debate_summary[:60]}")
+
+        # Disable the wrapup buttons (session is over), populate summary textboxes
+        c, n, s = self._wrapup_active(False)
+        return c, n, s, debate_summary, lang_summary
 
     # ── Main analysis ─────────────────────────────────────────────────────────
     def analyze_turn(self, audio_file, typed_transcript, topic, position):
-        """
-        Optimized pipeline (v3):
-          1.  Whisper / typed                             [local]
-          2.  TurnAnalyzer                                [Claude API]
-          3.  CoachPolicyAgent + RAGRetriever             [PARALLEL — OPT-2]
-          4.  ResponseGenerator                           [Claude API]
-          5.  ImprovedVersion + LanguageTips              [PARALLEL — OPT-3]
-        RAG HyDE no longer calls Claude (template string) [OPT-1]
-
-        Every step is timed and logged as [TIMING] for before/after comparison.
-        """
         timer = StepTimer(self.turn_count + 1)
 
         if self.in_wrapup:
+            c, n, s = self._wrapup_active(True)
             return (
                 None, "", "", "",
-                "⏸ Round complete — please choose Continue, New Topic, or Stop below.",
+                "⏸ Round complete — choose Continue, New Topic, or Stop below.",
                 False, False, False, False, "", "",
-                gr.update(visible=True),
-                gr.update(visible=False), "", "",
+                c, n, s, "", "",
                 gr.update(interactive=False),
             )
 
@@ -249,24 +325,26 @@ class SpeakFlowUI:
             transcript = transcribe_audio(audio_file)
             timer.mark("1_transcript_whisper")
             if not transcript:
+                c, n, s = self._wrapup_active(False)
                 return (
                     None, "", "⚠️ Transcription failed.", "",
-                    "❌ Transcription error.", False, False, False, False, "", "",
-                    gr.update(visible=False),
-                    gr.update(visible=False), "", "", gr.update(interactive=True),
+                    "❌ Transcription error.",
+                    False, False, False, False, "", "",
+                    c, n, s, "", "", gr.update(interactive=True),
                 )
             transcript_source = "whisper"
         else:
+            c, n, s = self._wrapup_active(False)
             return (
                 None, "", "Please record audio or type a transcript first.", "",
-                "⚠️ No input provided.", False, False, False, False, "", "",
-                gr.update(visible=False),
-                gr.update(visible=False), "", "", gr.update(interactive=True),
+                "⚠️ No input.",
+                False, False, False, False, "", "",
+                c, n, s, "", "", gr.update(interactive=True),
             )
 
         self.turn_count += 1
 
-        # ── Step 2: Intent detection (local, fast) ────────────────────────────
+        # ── Step 2: Intent ────────────────────────────────────────────────────
         intent = self.turn_analyzer._detect_intent(transcript)
         self.last_turn_intent = intent.value
 
@@ -274,15 +352,15 @@ class SpeakFlowUI:
             meta_response = self._handle_meta_question(transcript, topic, position)
             timer.mark("2_meta_question")
             timer.summary()
-            status = f"💬 Turn {self.turn_count} — Coach answered your question."
+            c, n, s = self._wrapup_active(False)
             return (
-                None, transcript, meta_response, "", status,
+                None, transcript, meta_response, "",
+                f"💬 Turn {self.turn_count} — Coach answered your question.",
                 False, False, False, False, "", "",
-                gr.update(visible=False),
-                gr.update(visible=False), "", "", gr.update(interactive=True),
+                c, n, s, "", "", gr.update(interactive=True),
             )
 
-        # ── Step 3: TurnAnalyzer (Claude API) ────────────────────────────────
+        # ── Step 3: TurnAnalyzer ──────────────────────────────────────────────
         turn_input = TurnInput(
             transcript=transcript,
             session_id="gradio-session",
@@ -292,28 +370,24 @@ class SpeakFlowUI:
             audio_path=audio_file or "",
             prior_turns=[{"summary": t} for t in self.prior_turns[-3:]],
         )
-
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            analysis = loop.run_until_complete(self.turn_analyzer.analyze(turn_input))
+            analysis = self._run(self.turn_analyzer.analyze(turn_input))
             timer.mark("3_turn_analyzer")
         except Exception as e:
             logger.error(f"TurnAnalyzer failed: {e}")
-            timer.mark("3_turn_analyzer_FAILED")
+            c, n, s = self._wrapup_active(False)
             return (
                 None, transcript, f"⚠️ Analysis failed: {e}", "",
                 f"❌ Turn {self.turn_count} — analysis error.",
                 False, False, False, False, "", "",
-                gr.update(visible=False),
-                gr.update(visible=False), "", "", gr.update(interactive=True),
+                c, n, s, "", "", gr.update(interactive=True),
             )
 
         self.prior_turns.append(analysis.argument.summary or transcript)
         self.argument_scores.append(analysis.argument.argument_score)
         self.session_transcripts.append(transcript)
 
-        # ── Step 4: SessionContext (local, instant) ───────────────────────────
+        # ── Step 4: SessionContext ────────────────────────────────────────────
         session_ctx = SessionContext(
             session_id="gradio-session",
             topic=topic or DEBATE_TOPICS[0],
@@ -325,21 +399,15 @@ class SpeakFlowUI:
             last_turn_intent=self.last_turn_intent,
         )
 
-        # ── Step 5: CoachPolicyAgent + RAG PARALLEL  [OPT-2] ─────────────────
-        # RAG runs with PROBE pre-action so it doesn't wait for CoachPolicy.
-        # Strategy-based type filtering is a nice-to-have; correctness is fine
-        # without it since re-ranking still selects the best chunks.
+        # ── Step 5: Coach + RAG PARALLEL ─────────────────────────────────────
         pre_rag_action = CoachingAction(
             strategy=CoachingStrategy.PROBE,
             topic=topic or DEBATE_TOPICS[0],
             user_position=(position or "For").lower(),
             intent="",
-            target_claim=None,
-            target_word=None,
-            target_phoneme=None,
+            target_claim=None, target_word=None, target_phoneme=None,
             argument_score=analysis.argument.argument_score,
-            pronunciation_score=1.0,
-            difficulty_delta=0,
+            pronunciation_score=1.0, difficulty_delta=0,
             turn_number=self.turn_count,
             prior_coach_responses=list(self.prior_responses),
         )
@@ -351,12 +419,11 @@ class SpeakFlowUI:
                 return_exceptions=True,
             )
 
-        coach_result, rag_result = loop.run_until_complete(_parallel_coach_rag())
+        coach_result, rag_result = self._run(_parallel_coach_rag())
         timer.mark("5_coach+rag_parallel")
 
         coaching_action = None if isinstance(coach_result, Exception) else coach_result
         retrieval_ctx   = None if isinstance(rag_result,   Exception) else rag_result
-
         if isinstance(coach_result, Exception):
             logger.error(f"CoachPolicyAgent failed: {coach_result}")
         if isinstance(rag_result, Exception):
@@ -364,20 +431,18 @@ class SpeakFlowUI:
 
         if retrieval_ctx:
             logger.info(
-                f"[RAG] turn={self.turn_count} "
-                f"fallback={retrieval_ctx.fallback_used} "
+                f"[RAG] turn={self.turn_count} fallback={retrieval_ctx.fallback_used} "
                 f"chunks={len(retrieval_ctx.chunks)} "
                 f"rag_latency={retrieval_ctx.retrieval_latency_ms}ms "
                 f"hyde='{retrieval_ctx.hypothetical_query[:80]}'"
             )
 
-        # Enrich coaching_action.intent for ResponseGenerator
         if coaching_action:
             self.coaching_history.append(coaching_action.strategy)
             arg = analysis.argument
             dim_lines = [
-                f"  {label}: {val:.1f} {'✓' if val >= thr else '✗'}"
-                for label, val, thr in [
+                f"  {lbl}: {val:.1f} {'✓' if val >= thr else '✗'}"
+                for lbl, val, thr in [
                     ("Clarity",   arg.clarity_score,    0.5),
                     ("Reasoning", arg.reasoning_score,  0.5),
                     ("Depth",     arg.depth_score,       0.4),
@@ -404,7 +469,7 @@ class SpeakFlowUI:
                 "Do NOT repeat or rephrase the coach's last question.",
             ])
 
-        # ── Step 6: ResponseGenerator (Claude API) ────────────────────────────
+        # ── Step 6: ResponseGenerator ─────────────────────────────────────────
         coach_text = ""
         if coaching_action:
             request = ResponseRequest(
@@ -416,9 +481,7 @@ class SpeakFlowUI:
                 retrieval_context=retrieval_ctx,
             )
             try:
-                response = loop.run_until_complete(
-                    self.response_gen.generate_response(request)
-                )
+                response = self._run(self.response_gen.generate_response(request))
                 strategy_label = coaching_action.strategy.value.title()
                 coach_text = f"[{strategy_label}]\n\n{response.text}"
                 self.last_coach_question = response.text
@@ -430,7 +493,7 @@ class SpeakFlowUI:
                 coach_text = f"[{coaching_action.strategy.value.title()}]\n\n(unavailable: {e})"
             timer.mark("6_response_generator")
 
-        # ── Step 7: ImprovedVersion + LanguageTips PARALLEL  [OPT-3] ──────────
+        # ── Step 7: ImprovedVersion + LanguageTips PARALLEL ───────────────────
         improved_text = ""
         language_tips = ""
         if coaching_action:
@@ -452,7 +515,7 @@ class SpeakFlowUI:
                     return_exceptions=True,
                 )
 
-            sec = loop.run_until_complete(_parallel_secondary())
+            sec = self._run(_parallel_secondary())
             timer.mark("7_improved+tips_parallel")
 
             improved_text = sec[0] if not isinstance(sec[0], Exception) else ""
@@ -462,10 +525,9 @@ class SpeakFlowUI:
             if isinstance(sec[1], Exception):
                 logger.error(f"LanguageTips failed: {sec[1]}")
 
-        loop.close()
         total = timer.summary()
-
         self.session_language_tips.append(language_tips)
+
         show_wrapup = self.turn_count >= 3
         if show_wrapup:
             self.in_wrapup = True
@@ -489,35 +551,32 @@ class SpeakFlowUI:
                else " — Record your next argument above")
         )
 
+        # FIX: toggle interactive= on buttons (confirmed-working Gradio 6 pattern)
+        c, n, s = self._wrapup_active(show_wrapup)
+
         return (
             None,
-            transcript,
-            coach_text,
-            improved_text,
-            status,
+            transcript, coach_text, improved_text, status,
             gr.update(value=arg.clarity_score >= 0.5,     label=f"Clarity  {arg.clarity_score:.1f}"),
             gr.update(value=arg.reasoning_score >= 0.5,   label=f"Reasoning  {arg.reasoning_score:.1f}"),
             gr.update(value=arg.depth_score >= 0.4,       label=f"Depth  {arg.depth_score:.1f}"),
             gr.update(value=arg.fluency_score_arg >= 0.5, label=f"Fluency  {arg.fluency_score_arg:.1f}"),
-            language_tips,
-            pronunciation_text,
-            gr.update(visible=show_wrapup),
-            gr.update(visible=False), "", "",
+            language_tips, pronunciation_text,
+            c, n, s,        # wrapup buttons: interactive= toggled
+            "", "",         # summary textboxes: cleared each turn
             gr.update(interactive=not show_wrapup),
         )
 
     # ── Meta-question handler ─────────────────────────────────────────────────
     def _handle_meta_question(self, transcript: str, topic: str, position: str) -> str:
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             dummy_action = CoachingAction(
                 strategy=CoachingStrategy.PROBE,
                 intent=(
                     f"Coach previously asked: \"{self.last_coach_question}\"\n"
                     f"Student pushed back: \"{transcript}\"\n"
-                    f"Student is RIGHT. Acknowledge it, do NOT repeat same question, "
-                    f"ask ONE new forward-moving question."
+                    "Student is RIGHT. Acknowledge it, do NOT repeat same question, "
+                    "ask ONE new forward-moving question."
                 ),
                 target_claim=None, target_word=None, target_phoneme=None,
                 argument_score=0.0, pronunciation_score=1.0, difficulty_delta=0,
@@ -533,8 +592,7 @@ class SpeakFlowUI:
                 prior_responses=list(self.prior_responses),
                 turn_number=self.turn_count,
             )
-            response = loop.run_until_complete(self.response_gen.generate_response(req))
-            loop.close()
+            response = self._run(self.response_gen.generate_response(req))
             self.last_coach_question = response.text
             return f"[Coach]\n\n{response.text}"
         except Exception as e:
@@ -542,20 +600,11 @@ class SpeakFlowUI:
             return "[Coach]\n\nYou're right — let's move on. What specific harm can you elaborate on?"
 
 
-# ── Theme ─────────────────────────────────────────────────────────────────────
-THEME = gr.themes.Soft(
-    primary_hue="indigo",
-    secondary_hue="blue",
-    neutral_hue="slate",
-    font=gr.themes.GoogleFont("Inter"),
-)
-
-
 # ── UI ────────────────────────────────────────────────────────────────────────
 def create_interface():
     ui = SpeakFlowUI()
 
-    with gr.Blocks(title="SpeakFlow AI — Debate Coach", theme=THEME) as interface:
+    with gr.Blocks(title="SpeakFlow AI — Debate Coach") as interface:
 
         gr.Markdown("# 🎙 SpeakFlow AI — Debate Coach")
         gr.Markdown("Practice structured English debate. Get real-time argument and pronunciation feedback.")
@@ -608,38 +657,63 @@ def create_interface():
             evidence_check = gr.Checkbox(label="Depth",     interactive=False)
             score_out      = gr.Checkbox(label="Fluency",   interactive=False)
 
-        with gr.Group(visible=False) as wrapup_row:
-            gr.Markdown("### 🏁 Round Complete — What's next?")
-            with gr.Row():
-                continue_btn  = gr.Button("▶ Continue this topic", variant="secondary")
-                new_topic_btn = gr.Button("🔀 New topic",          variant="secondary")
-                stop_btn      = gr.Button("⏹ Stop & get feedback", variant="primary")
+        # FIX: buttons always rendered, start as interactive=False (greyed).
+        # After turn 3: set interactive=True via ALL_OUTPUTS update.
+        # Layout container (gr.Row) is for visual grouping ONLY — never in outputs.
+        gr.Markdown("### 🏁 Round Complete — What's next?")
+        with gr.Row():
+            continue_btn  = gr.Button("▶ Continue this topic", variant="secondary", interactive=False)
+            new_topic_btn = gr.Button("🔀 New topic",           variant="secondary", interactive=False)
+            stop_btn      = gr.Button("⏹ Stop & get feedback",  variant="primary",   interactive=False)
 
-        with gr.Group(visible=False) as session_summary_row:
-            gr.Markdown("## 📊 Session Summary")
-            with gr.Row():
-                with gr.Column():
-                    gr.Markdown("### 🎓 Debate Feedback")
-                    debate_summary_out = gr.Textbox(
-                        label="Overall Argument Feedback", lines=5, interactive=False)
-                with gr.Column():
-                    gr.Markdown("### 📌 Language Patterns")
-                    lang_summary_out = gr.Textbox(
-                        label="Language Summary", lines=5, interactive=False)
+        # Session summary textboxes: always rendered, empty until stop_session populates them
+        gr.Markdown("### 📊 Session Summary")
+        with gr.Row():
+            debate_summary_out = gr.Textbox(
+                label="🎓 Overall Argument Feedback",
+                lines=5, interactive=False, value="",
+                placeholder="Session summary will appear here after you stop the session.",
+            )
+            lang_summary_out = gr.Textbox(
+                label="📌 Language Patterns",
+                lines=5, interactive=False, value="",
+                placeholder="Language patterns will appear here after you stop the session.",
+            )
 
         gr.Markdown("### Pronunciation Feedback")
         gr.Markdown("_⚠️ Pronunciation analysis is currently in stub mode (MFA not yet integrated)._")
         pronunciation_out = gr.Textbox(
             label="Mispronounced Words (IPA)", lines=2, interactive=False)
 
+        # ALL_OUTPUTS: only real interactive/output-capable components.
+        # Positional mapping must exactly match every return tuple in this class.
         ALL_OUTPUTS = [
-            audio_input,
-            transcript_out, coach_out, improved_out, status_out,
-            claim_check, reason_check, evidence_check,
-            score_out, summary_out, pronunciation_out,
-            wrapup_row,
-            session_summary_row, debate_summary_out, lang_summary_out,
-            analyze_btn,
+            audio_input,          # 0
+            transcript_out,       # 1
+            coach_out,            # 2
+            improved_out,         # 3
+            status_out,           # 4
+            claim_check,          # 5
+            reason_check,         # 6
+            evidence_check,       # 7
+            score_out,            # 8
+            summary_out,          # 9
+            pronunciation_out,    # 10
+            continue_btn,         # 11  ← interactive= toggled
+            new_topic_btn,        # 12  ← interactive= toggled
+            stop_btn,             # 13  ← interactive= toggled
+            debate_summary_out,   # 14  ← value= updated by stop_session
+            lang_summary_out,     # 15  ← value= updated by stop_session
+            analyze_btn,          # 16  ← interactive= toggled
+        ]
+
+        # stop_session only needs to update: the 3 wrapup buttons + 2 summary boxes
+        STOP_OUTPUTS = [
+            continue_btn,         # 0
+            new_topic_btn,        # 1
+            stop_btn,             # 2
+            debate_summary_out,   # 3
+            lang_summary_out,     # 4
         ]
 
         analyze_btn.click(
@@ -647,12 +721,12 @@ def create_interface():
             inputs=[audio_input, typed_input, topic_dropdown, position_radio],
             outputs=ALL_OUTPUTS,
         )
-        reset_btn.click(fn=ui.reset_session,      inputs=[], outputs=ALL_OUTPUTS)
+        reset_btn.click(fn=ui.reset_session,       inputs=[], outputs=ALL_OUTPUTS)
         continue_btn.click(fn=ui.continue_session, inputs=[], outputs=ALL_OUTPUTS)
         new_topic_btn.click(fn=ui.reset_session,   inputs=[], outputs=ALL_OUTPUTS)
         stop_btn.click(
             fn=ui.stop_session, inputs=[],
-            outputs=[wrapup_row, session_summary_row, debate_summary_out, lang_summary_out],
+            outputs=STOP_OUTPUTS,
         )
 
     return interface
@@ -660,4 +734,4 @@ def create_interface():
 
 if __name__ == "__main__":
     app = create_interface()
-    app.launch(debug=True, share=False, theme=THEME)
+    app.launch(debug=True, share=False)

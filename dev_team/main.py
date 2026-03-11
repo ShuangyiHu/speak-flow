@@ -369,6 +369,239 @@ ACCEPTANCE CRITERIA
 - Strip markdown fences before json.loads() — never call json.loads() on raw API text
 """,
     },
+    "rag_retriever": {
+        "module_name": "rag_retriever.py",
+        "class_name": "RAGRetriever",
+        "requirements": """
+The RAGRetriever module provides grounded debate knowledge retrieval for SpeakFlow AI.
+It is called between CoachPolicyAgent and ResponseGenerator to enrich coaching responses
+with concrete evidence, argument examples, and counter-argument patterns retrieved from
+a curated debate knowledge base.
+
+────────────────────────────────────────────────────────────────────────
+DESIGN PHILOSOPHY
+────────────────────────────────────────────────────────────────────────
+The core insight: users' spoken arguments are often weak or vague. Retrieving
+directly on a weak argument yields poor results. Instead, we use Hypothetical
+Document Embedding (HyDE): first generate a hypothetical "ideal version" of the
+user's argument using a lightweight LLM call, then use THAT as the retrieval query.
+This dramatically improves retrieval relevance without requiring perfect user input.
+
+Retrieval results are filtered by CoachingStrategy so that:
+- PROBE/CHALLENGE → return counter-arguments and evidence patterns
+- PRAISE → return examples of structurally strong arguments on the same topic
+- REDIRECT → return topic-anchoring claims and framing examples
+- CORRECT_PRONUNCIATION → skip retrieval (not applicable), return empty context
+
+────────────────────────────────────────────────────────────────────────
+IMPORTS — use shared_types.py for all shared models
+────────────────────────────────────────────────────────────────────────
+from shared_types import CoachingStrategy, CoachingAction, TurnAnalysis
+
+Do NOT redefine CoachingStrategy or CoachingAction.
+Import them from shared_types. Only define new types in this module.
+
+────────────────────────────────────────────────────────────────────────
+EXTERNAL DEPENDENCIES
+────────────────────────────────────────────────────────────────────────
+- chromadb                  — local vector store (pip install chromadb)
+- sentence-transformers     — embedding model (pip install sentence-transformers)
+  Use model: "all-MiniLM-L6-v2" (fast, good quality, 384-dim)
+- anthropic (AsyncAnthropic) — for HyDE generation only
+- Standard library: asyncio, os, json, re, dataclasses, typing, datetime, pathlib
+
+────────────────────────────────────────────────────────────────────────
+DATA MODELS (new, defined in this module)
+────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class DebateChunk:
+    chunk_id: str
+    text: str                       # The actual debate content
+    topic: str                      # e.g. "renewable energy", "universal basic income"
+    argument_type: str              # "claim", "evidence", "counter_argument", "rebuttal", "framework"
+    strength_score: float           # 0.0–1.0, quality rating of this argument chunk
+    source: str                     # Dataset origin: "DebateSum" | "IBM_ArgKP" | "manual"
+    metadata: dict                  # Any additional fields (e.g. original doc_id, year)
+
+@dataclass
+class RetrievalContext:
+    chunks: List[DebateChunk]       # Top-k retrieved and re-ranked chunks
+    hypothetical_query: str         # The HyDE-generated query used for retrieval
+    strategy_filter: str            # Which CoachingStrategy triggered this retrieval
+    retrieval_latency_ms: int
+    fallback_used: bool             # True if vector store unavailable or retrieval failed
+
+────────────────────────────────────────────────────────────────────────
+CORE CLASS
+────────────────────────────────────────────────────────────────────────
+
+class RAGRetriever:
+
+    def __init__(self, collection_name: str = "speakflow_debate_kb"):
+        Initialize:
+        - Load SentenceTransformer("all-MiniLM-L6-v2") for embeddings
+        - Connect to ChromaDB (persistent client, path from env var
+          CHROMA_DB_PATH or default "./chroma_db")
+        - Get or create collection with name collection_name
+        - Initialize AsyncAnthropic client with timeout from
+          os.getenv("ANTHROPIC_TIMEOUT_SECONDS", "30")
+        - Set self._kb_available = True/False depending on whether
+          ChromaDB collection has > 0 documents
+
+    async def retrieve(
+        self,
+        coaching_action: CoachingAction,
+        turn_analysis: TurnAnalysis,
+        top_k: int = 3,
+    ) -> RetrievalContext:
+        Main entry point. Called by the LangGraph pipeline after CoachPolicyAgent.
+
+        Steps:
+        1. If strategy is CORRECT_PRONUNCIATION, return empty RetrievalContext
+           immediately (retrieval not applicable for pronunciation coaching).
+        2. If self._kb_available is False, return fallback RetrievalContext
+           with hardcoded stub chunks (see _get_fallback_context).
+        3. Call _generate_hypothetical_query(coaching_action, turn_analysis)
+           to get a strong hypothetical argument for retrieval.
+        4. Embed the hypothetical query using self._embed(text).
+        5. Query ChromaDB with the embedding, applying metadata filter for
+           strategy-appropriate argument_types (see _get_type_filter).
+        6. Parse results into List[DebateChunk].
+        7. Re-rank chunks with _rerank(chunks, coaching_action) —
+           sort by: (0.6 * similarity_score + 0.4 * chunk.strength_score).
+        8. Return RetrievalContext with top_k chunks.
+
+        Must complete within 2 seconds total. Use asyncio.wait_for with timeout.
+        On any exception, log the error and return _get_fallback_context().
+
+    async def _generate_hypothetical_query(
+        self,
+        coaching_action: CoachingAction,
+        turn_analysis: TurnAnalysis,
+    ) -> str:
+        HyDE: generate an ideal version of the user's argument for retrieval.
+
+        IMPORTANT: turn_analysis MUST be used to extract the user's actual argument
+        weakness. Specifically, read turn_analysis.argument.summary to get a
+        one-sentence description of what the user actually said, and read
+        turn_analysis.argument.logical_gaps (a List[str]) to get identified weaknesses.
+        These must appear in the prompt so the hypothetical query is grounded in
+        the user's real argument, not just the topic.
+
+        Build the Claude prompt exactly like this (fill in the placeholders):
+
+          prompt = (
+              f"Write a 2-sentence strong debate argument on the topic: '{coaching_action.topic}'. "
+              f"Position: {coaching_action.user_position}. "
+              f"The student's current argument summary: '{turn_analysis.argument.summary}'. "
+              f"Their identified weaknesses: {turn_analysis.argument.logical_gaps}. "
+              f"Write the ideal version of this argument that fixes those weaknesses. "
+              f"Return only the 2-sentence argument, no preamble."
+          )
+
+        Call Claude with that prompt. Use model from os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5").
+        Use asyncio.wait_for with HYDE_TIMEOUT_SECONDS. On any failure or timeout,
+        return coaching_action.topic as the fallback string.
+        Strip markdown fences before returning: re.sub(r"```[a-z]*\n?|```", "", text).strip()
+
+    def _embed(self, text: str) -> List[float]:
+        Synchronous. Use self._embedding_model.encode(text).tolist().
+        Returns a list of floats (384-dim vector for all-MiniLM-L6-v2).
+
+    def _get_type_filter(self, strategy: CoachingStrategy) -> List[str]:
+        Map CoachingStrategy to argument_types for ChromaDB metadata filtering.
+
+        Mapping:
+          PROBE             → ["evidence", "framework"]
+          CHALLENGE         → ["counter_argument", "rebuttal"]
+          REDIRECT          → ["claim", "framework"]
+          PRAISE            → ["claim", "evidence"]   (show strong examples)
+          CORRECT_PRONUNCIATION → []                  (never reaches here)
+
+    def _rerank(
+        self,
+        chunks: List[DebateChunk],
+        distances: List[float],
+        coaching_action: CoachingAction,
+    ) -> List[DebateChunk]:
+        Synchronous. Re-rank retrieved chunks by composite score.
+        composite = 0.6 * (1 - distance) + 0.4 * chunk.strength_score
+        Sort descending. Return sorted list.
+
+    def _get_fallback_context(self, strategy: CoachingStrategy) -> RetrievalContext:
+        Return a hardcoded RetrievalContext with 2 stub DebateChunks
+        appropriate for the given strategy. Used when KB is unavailable
+        or retrieval fails. fallback_used must be True.
+
+        Stub chunks must be non-empty, plausible debate content —
+        not placeholder strings like "example argument here".
+        Write real, useful stub content for at least:
+          PROBE: evidence-seeking framework ("What data would your opponent demand...")
+          CHALLENGE: a concrete counter-argument pattern
+          REDIRECT: a topic-anchoring prompt
+
+    async def index_chunks(self, chunks: List[DebateChunk]) -> int:
+        Async wrapper for batch indexing. Used during knowledge base setup.
+        This method MUST have a complete implementation body — not just a docstring.
+
+        Implementation must do ALL of the following steps:
+        1. Initialize a counter: indexed_count = 0
+        2. Split chunks into batches of 50: use list slicing chunks[i:i+50]
+        3. For each batch, iterate over each chunk and:
+           a. Call embedding_vector = await asyncio.to_thread(self._embed, chunk.text)
+           b. Collect: ids, embeddings, metadatas, documents lists for the batch
+              - ids: [chunk.chunk_id]
+              - embeddings: [embedding_vector]
+              - documents: [chunk.text]
+              - metadatas: [{"topic": chunk.topic, "argument_type": chunk.argument_type,
+                             "strength_score": chunk.strength_score, "source": chunk.source}]
+        4. Call self._collection.upsert(ids=ids, embeddings=embeddings,
+                                         documents=documents, metadatas=metadatas)
+        5. Add len(batch) to indexed_count
+        6. After all batches, set self._kb_available = True
+        7. Return indexed_count
+
+        Wrap the entire method body in try/except Exception, log errors, return 0 on failure.
+
+────────────────────────────────────────────────────────────────────────
+CONSTANTS
+────────────────────────────────────────────────────────────────────────
+RETRIEVAL_TIMEOUT_SECONDS = 20.0
+HYDE_TIMEOUT_SECONDS = 5.0
+DEFAULT_TOP_K = 3
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+
+────────────────────────────────────────────────────────────────────────
+KEY BEHAVIORS
+────────────────────────────────────────────────────────────────────────
+- retrieve() is the ONLY public async method called by the pipeline
+- _generate_hypothetical_query() must never block — use asyncio properly
+- _embed() is synchronous; wrap with asyncio.to_thread if called inside async context
+- ChromaDB client must be initialized once in __init__, not per call
+- If CHROMA_DB_PATH does not exist, create it (chromadb handles this automatically)
+- self._kb_available check must happen BEFORE any retrieval attempt
+- All ChromaDB queries must include where= filter for argument_type
+  when _get_type_filter returns a non-empty list
+- Model name: os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+- Timeout on AsyncAnthropic() init only — NOT inside messages.create()
+- Strip markdown fences before json.loads(): re.sub(r"```[a-z]*\n?|```", "", text).strip()
+
+────────────────────────────────────────────────────────────────────────
+ACCEPTANCE CRITERIA
+────────────────────────────────────────────────────────────────────────
+- retrieve() returns RetrievalContext within 2 seconds total
+- Returns empty chunks (not an error) for CORRECT_PRONUNCIATION strategy
+- Returns fallback context (fallback_used=True) when KB has 0 documents
+- _generate_hypothetical_query() returns a coherent 2-sentence argument string
+- Re-ranked results always sorted by composite score descending
+- index_chunks() returns correct count of upserted documents
+- No exception propagates from retrieve() — always returns RetrievalContext
+- _get_fallback_context() returns real, useful stub content for all strategies
+- ChromaDB collection persists across process restarts (persistent client)
+""",
+    },
+    
 }
 
 

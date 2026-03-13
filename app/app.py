@@ -1,38 +1,23 @@
 """
-app.py — SpeakFlow AI Gradio frontend  (v7)
+app.py — SpeakFlow AI Gradio frontend  (v8)
 ============================================
 ⚠️  UI DESIGN IS FROZEN — DO NOT MODIFY LAYOUT WITHOUT EXPLICIT APPROVAL ⚠️
 
-Latency optimizations (v3):
+Latency optimizations:
   OPT-1: RAG HyDE Claude call → template string
   OPT-2: CoachPolicy + RAG parallelized
   OPT-3: ImprovedVersion + LanguageTips parallel
 
-Bug fix history:
-  FIX-1 (v4): stop_session async→sync via _run()
-  FIX-2 (v5): gr.Group→gr.Column for visibility (incorrect — didn't fix root cause)
-  FIX-3 (v5): session summary bypasses 2.0s internal timeout (direct client, 45s budget)
-  FIX-4 (v6): removed layout containers from outputs — buttons still didn't appear
-
-ROOT CAUSE CONFIRMED (v7):
-  In Gradio 6.x, gr.update(visible=True) on a Button that starts with visible=False
-  does NOT reliably work. The component is in the DOM with display:none, and the
-  update is processed without error, but the UI never reflects the change.
-  
-  EVIDENCE: gr.update(interactive=False) on analyze_btn DOES work (confirmed visible
-  in screenshot as greyed-out). interactive= updates are reliable; visible= updates
-  on initially-hidden components are not.
-
-FIX (v7):
-  All three wrapup buttons (continue, new_topic, stop) are rendered ALWAYS VISIBLE
-  but start as interactive=False (greyed out, unclickable — same as analyze_btn).
-  After turn 3: set interactive=True → buttons become active.
-  After stop:   set interactive=False again.
-  
-  Summary textboxes also always rendered (empty string = no visual noise).
-  stop_session populates them via value= update.
-  
-  This matches the confirmed-working pattern of analyze_btn interactive toggling.
+Key architectural decisions:
+  - Wrapup buttons (continue / new topic / stop) are always rendered but start
+    as interactive=False. After turn 3 they become active. Required because
+    gr.update(visible=True) on initially-hidden components is unreliable in Gradio 6.x.
+  - debate_summary_out and lang_summary_out are excluded from ALL_OUTPUTS so that
+    analyze_turn never touches them — preventing loading spinners during per-turn analysis.
+    They are only written by stop_session via STOP_OUTPUTS, and cleared on reset/continue
+    via CLEAR_OUTPUTS = ALL_OUTPUTS + [debate_summary_out, lang_summary_out].
+  - stop_session generates summaries via direct AsyncAnthropic calls (45s budget)
+    using the same client instance as ResponseGenerator.
 """
 
 import asyncio
@@ -169,8 +154,6 @@ class SpeakFlowUI:
             loop.close()
 
     # ── Wrapup button state helpers ───────────────────────────────────────────
-    # Returns (continue_btn, new_topic_btn, stop_btn) updates.
-    # active=True → clickable; active=False → greyed (same as analyze_btn pattern).
     @staticmethod
     def _wrapup_active(active: bool):
         return (
@@ -199,8 +182,8 @@ class SpeakFlowUI:
             "🔄 Session reset. Record your first argument.",
             False, False, False, False, "", "",
             c, n, s,
-            "", "",           # clear summary textboxes
             gr.update(interactive=True),
+            "", "",           # clear summary textboxes (CLEAR_OUTPUTS positions 15 & 16)
         )
 
     def continue_session(self):
@@ -212,15 +195,13 @@ class SpeakFlowUI:
             "▶ Continuing — record your next argument above.",
             False, False, False, False, "", "",
             c, n, s,
-            "", "",
             gr.update(interactive=True),
+            "", "",           # clear summary textboxes (CLEAR_OUTPUTS positions 15 & 16)
         )
 
     # ── stop_session ──────────────────────────────────────────────────────────
     def stop_session(self):
-        """
-        Generate session summaries directly via Anthropic client (45s budget),
-        bypassing response_generator's internal 2.0s timeout.
+        """Generate summaries via direct Claude API calls (45s budget).
         Returns updates for: continue_btn, new_topic_btn, stop_btn,
                               debate_summary_out, lang_summary_out
         """
@@ -295,7 +276,6 @@ class SpeakFlowUI:
         elapsed = time.time() - t_start
         logger.info(f"[STOP] done in {elapsed:.1f}s | debate: {debate_summary[:60]}")
 
-        # Disable the wrapup buttons (session is over), populate summary textboxes
         c, n, s = self._wrapup_active(False)
         return c, n, s, debate_summary, lang_summary
 
@@ -309,7 +289,7 @@ class SpeakFlowUI:
                 None, "", "", "",
                 "⏸ Round complete — choose Continue, New Topic, or Stop below.",
                 False, False, False, False, "", "",
-                c, n, s, "", "",
+                c, n, s,
                 gr.update(interactive=False),
             )
 
@@ -330,7 +310,7 @@ class SpeakFlowUI:
                     None, "", "⚠️ Transcription failed.", "",
                     "❌ Transcription error.",
                     False, False, False, False, "", "",
-                    c, n, s, "", "", gr.update(interactive=True),
+                    c, n, s, gr.update(interactive=True),
                 )
             transcript_source = "whisper"
         else:
@@ -339,7 +319,7 @@ class SpeakFlowUI:
                 None, "", "Please record audio or type a transcript first.", "",
                 "⚠️ No input.",
                 False, False, False, False, "", "",
-                c, n, s, "", "", gr.update(interactive=True),
+                c, n, s, gr.update(interactive=True),
             )
 
         self.turn_count += 1
@@ -357,7 +337,7 @@ class SpeakFlowUI:
                 None, transcript, meta_response, "",
                 f"💬 Turn {self.turn_count} — Coach answered your question.",
                 False, False, False, False, "", "",
-                c, n, s, "", "", gr.update(interactive=True),
+                c, n, s, gr.update(interactive=True),
             )
 
         # ── Step 3: TurnAnalyzer ──────────────────────────────────────────────
@@ -380,7 +360,7 @@ class SpeakFlowUI:
                 None, transcript, f"⚠️ Analysis failed: {e}", "",
                 f"❌ Turn {self.turn_count} — analysis error.",
                 False, False, False, False, "", "",
-                c, n, s, "", "", gr.update(interactive=True),
+                c, n, s, gr.update(interactive=True),
             )
 
         self.prior_turns.append(analysis.argument.summary or transcript)
@@ -551,9 +531,10 @@ class SpeakFlowUI:
                else " — Record your next argument above")
         )
 
-        # FIX: toggle interactive= on buttons (confirmed-working Gradio 6 pattern)
         c, n, s = self._wrapup_active(show_wrapup)
 
+        # NOTE: debate_summary_out and lang_summary_out are NOT in ALL_OUTPUTS,
+        # so this return tuple has exactly 15 items matching ALL_OUTPUTS.
         return (
             None,
             transcript, coach_text, improved_text, status,
@@ -562,8 +543,7 @@ class SpeakFlowUI:
             gr.update(value=arg.depth_score >= 0.4,       label=f"Depth  {arg.depth_score:.1f}"),
             gr.update(value=arg.fluency_score_arg >= 0.5, label=f"Fluency  {arg.fluency_score_arg:.1f}"),
             language_tips, pronunciation_text,
-            c, n, s,        # wrapup buttons: interactive= toggled
-            "", "",         # summary textboxes: cleared each turn
+            c, n, s,
             gr.update(interactive=not show_wrapup),
         )
 
@@ -657,16 +637,12 @@ def create_interface():
             evidence_check = gr.Checkbox(label="Depth",     interactive=False)
             score_out      = gr.Checkbox(label="Fluency",   interactive=False)
 
-        # FIX: buttons always rendered, start as interactive=False (greyed).
-        # After turn 3: set interactive=True via ALL_OUTPUTS update.
-        # Layout container (gr.Row) is for visual grouping ONLY — never in outputs.
         gr.Markdown("### 🏁 Round Complete — What's next?")
         with gr.Row():
             continue_btn  = gr.Button("▶ Continue this topic", variant="secondary", interactive=False)
             new_topic_btn = gr.Button("🔀 New topic",           variant="secondary", interactive=False)
             stop_btn      = gr.Button("⏹ Stop & get feedback",  variant="primary",   interactive=False)
 
-        # Session summary textboxes: always rendered, empty until stop_session populates them
         gr.Markdown("### 📊 Session Summary")
         with gr.Row():
             debate_summary_out = gr.Textbox(
@@ -685,8 +661,11 @@ def create_interface():
         pronunciation_out = gr.Textbox(
             label="Mispronounced Words (IPA)", lines=2, interactive=False)
 
-        # ALL_OUTPUTS: only real interactive/output-capable components.
-        # Positional mapping must exactly match every return tuple in this class.
+        # ALL_OUTPUTS: used by analyze_turn, reset_session, continue_session.
+        # debate_summary_out and lang_summary_out are intentionally EXCLUDED —
+        # they are only ever written by stop_session via STOP_OUTPUTS.
+        # Including them here would cause Gradio to show a loading spinner on
+        # every analyze_turn call, even though analyze_turn never touches them.
         ALL_OUTPUTS = [
             audio_input,          # 0
             transcript_out,       # 1
@@ -702,12 +681,10 @@ def create_interface():
             continue_btn,         # 11  ← interactive= toggled
             new_topic_btn,        # 12  ← interactive= toggled
             stop_btn,             # 13  ← interactive= toggled
-            debate_summary_out,   # 14  ← value= updated by stop_session
-            lang_summary_out,     # 15  ← value= updated by stop_session
-            analyze_btn,          # 16  ← interactive= toggled
+            analyze_btn,          # 14  ← interactive= toggled
         ]
 
-        # stop_session only needs to update: the 3 wrapup buttons + 2 summary boxes
+        # STOP_OUTPUTS: only stop_session writes to these.
         STOP_OUTPUTS = [
             continue_btn,         # 0
             new_topic_btn,        # 1
@@ -716,14 +693,17 @@ def create_interface():
             lang_summary_out,     # 4
         ]
 
+        # CLEAR_OUTPUTS: reset_session and continue_session also clear summary boxes.
+        CLEAR_OUTPUTS = ALL_OUTPUTS + [debate_summary_out, lang_summary_out]
+
         analyze_btn.click(
             fn=ui.analyze_turn,
             inputs=[audio_input, typed_input, topic_dropdown, position_radio],
             outputs=ALL_OUTPUTS,
         )
-        reset_btn.click(fn=ui.reset_session,       inputs=[], outputs=ALL_OUTPUTS)
-        continue_btn.click(fn=ui.continue_session, inputs=[], outputs=ALL_OUTPUTS)
-        new_topic_btn.click(fn=ui.reset_session,   inputs=[], outputs=ALL_OUTPUTS)
+        reset_btn.click(fn=ui.reset_session,       inputs=[], outputs=CLEAR_OUTPUTS)
+        continue_btn.click(fn=ui.continue_session, inputs=[], outputs=CLEAR_OUTPUTS)
+        new_topic_btn.click(fn=ui.reset_session,   inputs=[], outputs=CLEAR_OUTPUTS)
         stop_btn.click(
             fn=ui.stop_session, inputs=[],
             outputs=STOP_OUTPUTS,

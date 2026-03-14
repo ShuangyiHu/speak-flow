@@ -1,23 +1,28 @@
 """
-app.py — SpeakFlow AI Gradio frontend  (v8)
+app.py — SpeakFlow AI Gradio frontend  (v9)
 ============================================
 ⚠️  UI DESIGN IS FROZEN — DO NOT MODIFY LAYOUT WITHOUT EXPLICIT APPROVAL ⚠️
 
-Latency optimizations:
-  OPT-1: RAG HyDE Claude call → template string
-  OPT-2: CoachPolicy + RAG parallelized
-  OPT-3: ImprovedVersion + LanguageTips parallel
+Architecture:
+  All per-turn orchestration (Steps 3-7) is now delegated to pipeline.py
+  (LangGraph StateGraph). app.py is responsible only for UI and session
+  lifecycle — not for wiring modules together.
 
-Key architectural decisions:
-  - Wrapup buttons (continue / new topic / stop) are always rendered but start
-    as interactive=False. After turn 3 they become active. Required because
-    gr.update(visible=True) on initially-hidden components is unreliable in Gradio 6.x.
-  - debate_summary_out and lang_summary_out are excluded from ALL_OUTPUTS so that
-    analyze_turn never touches them — preventing loading spinners during per-turn analysis.
-    They are only written by stop_session via STOP_OUTPUTS, and cleared on reset/continue
-    via CLEAR_OUTPUTS = ALL_OUTPUTS + [debate_summary_out, lang_summary_out].
-  - stop_session generates summaries via direct AsyncAnthropic calls (45s budget)
-    using the same client instance as ResponseGenerator.
+  pipeline.ainvoke() runs the full graph per turn:
+    intent_node → fan-out [score_node ‖ summary_node ‖ pronunciation_node]
+    → merge_analysis_node → [coach_policy_node ‖ rag_node] → response_node
+    → update_session_node
+
+  Session state (prior_turns, coaching_history, argument_scores, etc.) is
+  persisted by LangGraph MemorySaver, keyed by thread_id = session_id.
+  reset_session() uses a new thread_id to start a clean slate.
+
+Key UI decisions:
+  - Wrapup buttons always rendered, start as interactive=False (Gradio 6.x
+    visible= updates on hidden components are unreliable).
+  - debate_summary_out / lang_summary_out excluded from ALL_OUTPUTS to
+    prevent loading spinners during per-turn analysis.
+  - stop_session generates summaries via direct AsyncAnthropic calls (45s).
 """
 
 import asyncio
@@ -30,18 +35,7 @@ from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
-from turn_analyzer import TurnAnalyzer
-from coach_policy import CoachPolicyAgent
-from response_generator import ResponseGenerator
-from rag_retriever import RAGRetriever
-from shared_types import (
-    TurnInput,
-    CoachingStrategy,
-    CoachingAction,
-    SessionContext,
-    TurnIntent,
-    ResponseRequest,
-)
+from pipeline import SpeakFlowPipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -126,20 +120,15 @@ class StepTimer:
 # ── State class ───────────────────────────────────────────────────────────────
 class SpeakFlowUI:
     def __init__(self):
-        self.turn_analyzer  = TurnAnalyzer(anthropic_api_key=ANTHROPIC_API_KEY)
-        self.coach          = CoachPolicyAgent(mfa_enabled=False)
-        self.response_gen   = ResponseGenerator()
-        self.rag_retriever  = RAGRetriever()
+        # Pipeline owns all module instances internally (TurnAnalyzer,
+        # CoachPolicyAgent, ResponseGenerator, RAGRetriever).
+        # ResponseGenerator is still exposed for stop_session summaries.
+        self.pipeline    = SpeakFlowPipeline()
+        self.response_gen = self.pipeline._response_gen   # reuse for stop_session
+        self._session_id  = "gradio-session-0"            # rotated on reset
 
-        self.turn_count: int              = 0
-        self.prior_turns: list[str]       = []
-        self.prior_responses: list[str]   = []
-        self.argument_scores: list[float] = []
-        self.coaching_history: list[CoachingStrategy] = []
-        self.last_coach_question: str     = ""
-        self.last_turn_intent: str        = ""
-        self.session_transcripts: list[str]   = []
-        self.session_language_tips: list[str] = []
+        # Local state: only what pipeline.py does NOT persist
+        # (session topic/position for stop_session, wrapup flag for UI gating)
         self.session_topic: str    = ""
         self.session_position: str = ""
         self.in_wrapup: bool       = False
@@ -164,18 +153,12 @@ class SpeakFlowUI:
 
     # ── Reset ─────────────────────────────────────────────────────────────────
     def reset_session(self):
-        self.turn_count = 0
-        self.prior_turns = []
-        self.prior_responses = []
-        self.argument_scores = []
-        self.coaching_history = []
-        self.last_coach_question = ""
-        self.last_turn_intent = ""
-        self.session_transcripts = []
-        self.session_language_tips = []
-        self.session_topic = ""
+        # Rotate session_id so MemorySaver starts a clean checkpoint thread.
+        import uuid
+        self._session_id   = f"gradio-session-{uuid.uuid4().hex[:8]}"
+        self.session_topic    = ""
         self.session_position = ""
-        self.in_wrapup = False
+        self.in_wrapup        = False
         c, n, s = self._wrapup_active(False)
         return (
             None, "", "", "",
@@ -183,11 +166,12 @@ class SpeakFlowUI:
             False, False, False, False, "", "",
             c, n, s,
             gr.update(interactive=True),
-            "", "",           # clear summary textboxes (CLEAR_OUTPUTS positions 15 & 16)
+            "", "",           # clear summary textboxes
         )
 
     def continue_session(self):
-        self.turn_count = 2
+        # Keep same session_id — MemorySaver will restore state from the
+        # checkpoint. Pipeline turn_number continues from where it left off.
         self.in_wrapup = False
         c, n, s = self._wrapup_active(False)
         return (
@@ -196,12 +180,13 @@ class SpeakFlowUI:
             False, False, False, False, "", "",
             c, n, s,
             gr.update(interactive=True),
-            "", "",           # clear summary textboxes (CLEAR_OUTPUTS positions 15 & 16)
+            "", "",           # clear summary textboxes
         )
 
     # ── stop_session ──────────────────────────────────────────────────────────
     def stop_session(self):
         """Generate summaries via direct Claude API calls (45s budget).
+        Session data (transcripts, scores, tips) is read from pipeline MemorySaver.
         Returns updates for: continue_btn, new_topic_btn, stop_btn,
                               debate_summary_out, lang_summary_out
         """
@@ -211,17 +196,25 @@ class SpeakFlowUI:
         debate_summary = "Great session! You built up your argument well across the turns."
         lang_summary   = "Keep practising connectors like 'therefore' and 'however'."
 
-        if self.session_transcripts:
+        # Read session history from pipeline MemorySaver checkpoint
+        config = {"configurable": {"thread_id": self._session_id}}
+        session_state = self.pipeline.get_session_state(config)
+        session_transcripts   = session_state.get("session_transcripts")   or []
+        argument_scores       = session_state.get("argument_scores")       or []
+        session_language_tips = session_state.get("session_language_tips") or []
+
+        if session_transcripts:
             async def _summaries_direct():
                 client = self.response_gen._client
                 model  = self.response_gen._model
 
                 turns_text = "\n".join(
-                    f"Turn {i+1} (score {self.argument_scores[i]:.2f}): {t}"
-                    for i, t in enumerate(self.session_transcripts)
+                    f"Turn {i+1} (score {argument_scores[i]:.2f}): {t}"
+                    for i, t in enumerate(session_transcripts)
+                    if i < len(argument_scores)
                 )
-                avg = (sum(self.argument_scores) / len(self.argument_scores)
-                       if self.argument_scores else 0)
+                avg = (sum(argument_scores) / len(argument_scores)
+                       if argument_scores else 0)
 
                 debate_prompt = (
                     f'You are a debate coach giving end-of-session feedback.\n\n'
@@ -233,7 +226,7 @@ class SpeakFlowUI:
                 )
                 tips_text = "\n".join(
                     f"Turn {i+1}: {t}"
-                    for i, t in enumerate(self.session_language_tips) if t
+                    for i, t in enumerate(session_language_tips) if t
                 )
                 lang_prompt = (
                     'You are an English teacher summarising language patterns.\n\n'
@@ -281,7 +274,7 @@ class SpeakFlowUI:
 
     # ── Main analysis ─────────────────────────────────────────────────────────
     def analyze_turn(self, audio_file, typed_transcript, topic, position):
-        timer = StepTimer(self.turn_count + 1)
+        timer = StepTimer(1)  # turn number tracked by pipeline, use 1 as placeholder
 
         if self.in_wrapup:
             c, n, s = self._wrapup_active(True)
@@ -322,262 +315,85 @@ class SpeakFlowUI:
                 c, n, s, gr.update(interactive=True),
             )
 
-        self.turn_count += 1
-
-        # ── Step 2: Intent ────────────────────────────────────────────────────
-        intent = self.turn_analyzer._detect_intent(transcript)
-        self.last_turn_intent = intent.value
-
-        if intent == TurnIntent.META_QUESTION:
-            meta_response = self._handle_meta_question(transcript, topic, position)
-            timer.mark("2_meta_question")
-            timer.summary()
-            c, n, s = self._wrapup_active(False)
-            return (
-                None, transcript, meta_response, "",
-                f"💬 Turn {self.turn_count} — Coach answered your question.",
-                False, False, False, False, "", "",
-                c, n, s, gr.update(interactive=True),
-            )
-
-        # ── Step 3: TurnAnalyzer ──────────────────────────────────────────────
-        turn_input = TurnInput(
-            transcript=transcript,
-            session_id="gradio-session",
-            turn_number=self.turn_count,
-            topic=topic or DEBATE_TOPICS[0],
-            user_position=(position or "For").lower(),
-            audio_path=audio_file or "",
-            prior_turns=[{"summary": t} for t in self.prior_turns[-3:]],
-        )
+        # ── Steps 2-7: delegated to LangGraph pipeline ───────────────────────
+        # pipeline.ainvoke() runs the full graph:
+        #   intent_node → [score_node ‖ summary_node ‖ pronunciation_node]
+        #   → merge_analysis_node → [coach_policy_node ‖ rag_node]
+        #   → response_node → update_session_node
+        # Session state is persisted by MemorySaver (thread_id = session_id).
+        config = {"configurable": {"thread_id": self._session_id}}
         try:
-            analysis = self._run(self.turn_analyzer.analyze(turn_input))
-            timer.mark("3_turn_analyzer")
+            result = self._run(self.pipeline.ainvoke({
+                "transcript":   transcript,
+                "topic":        topic or DEBATE_TOPICS[0],
+                "user_position": (position or "For").lower(),
+                "session_id":   self._session_id,
+                "audio_path":   audio_file or "",
+            }, config=config))
+            timer.mark("pipeline_ainvoke")
         except Exception as e:
-            logger.error(f"TurnAnalyzer failed: {e}")
+            logger.error(f"Pipeline failed: {e}")
             c, n, s = self._wrapup_active(False)
             return (
-                None, transcript, f"⚠️ Analysis failed: {e}", "",
-                f"❌ Turn {self.turn_count} — analysis error.",
+                None, transcript, f"⚠️ Pipeline error: {e}", "",
+                f"❌ Pipeline error.",
                 False, False, False, False, "", "",
                 c, n, s, gr.update(interactive=True),
             )
 
-        self.prior_turns.append(analysis.argument.summary or transcript)
-        self.argument_scores.append(analysis.argument.argument_score)
-        self.session_transcripts.append(transcript)
+        # ── Extract outputs from pipeline state ───────────────────────────────
+        coach_text        = result.get("coach_text", "")
+        improved_text     = result.get("improved_text", "")
+        language_tips     = result.get("language_tips", "")
+        pronunciation_text = result.get("pronunciation_text", "✓ No pronunciation issues detected")
+        turn_number       = result.get("turn_number", 1)
+        analysis          = result.get("turn_analysis")
 
-        # ── Step 4: SessionContext ────────────────────────────────────────────
-        session_ctx = SessionContext(
-            session_id="gradio-session",
-            topic=topic or DEBATE_TOPICS[0],
-            user_position=(position or "For").lower(),
-            turn_number=self.turn_count,
-            coaching_history=list(self.coaching_history),
-            argument_scores=list(self.argument_scores),
-            last_coach_question=self.last_coach_question,
-            last_turn_intent=self.last_turn_intent,
-        )
-
-        # ── Step 5: Coach + RAG PARALLEL ─────────────────────────────────────
-        pre_rag_action = CoachingAction(
-            strategy=CoachingStrategy.PROBE,
-            topic=topic or DEBATE_TOPICS[0],
-            user_position=(position or "For").lower(),
-            intent="",
-            target_claim=None, target_word=None, target_phoneme=None,
-            argument_score=analysis.argument.argument_score,
-            pronunciation_score=1.0, difficulty_delta=0,
-            turn_number=self.turn_count,
-            prior_coach_responses=list(self.prior_responses),
-        )
-
-        async def _parallel_coach_rag():
-            return await asyncio.gather(
-                self.coach.decide(analysis, session_ctx),
-                self.rag_retriever.retrieve(pre_rag_action, analysis),
-                return_exceptions=True,
-            )
-
-        coach_result, rag_result = self._run(_parallel_coach_rag())
-        timer.mark("5_coach+rag_parallel")
-
-        coaching_action = None if isinstance(coach_result, Exception) else coach_result
-        retrieval_ctx   = None if isinstance(rag_result,   Exception) else rag_result
-        if isinstance(coach_result, Exception):
-            logger.error(f"CoachPolicyAgent failed: {coach_result}")
-        if isinstance(rag_result, Exception):
-            logger.error(f"RAGRetriever failed: {rag_result}")
-
-        if retrieval_ctx:
-            logger.info(
-                f"[RAG] turn={self.turn_count} fallback={retrieval_ctx.fallback_used} "
-                f"chunks={len(retrieval_ctx.chunks)} "
-                f"rag_latency={retrieval_ctx.retrieval_latency_ms}ms "
-                f"hyde='{retrieval_ctx.hypothetical_query[:80]}'"
-            )
-
-        if coaching_action:
-            self.coaching_history.append(coaching_action.strategy)
-            arg = analysis.argument
-            dim_lines = [
-                f"  {lbl}: {val:.1f} {'✓' if val >= thr else '✗'}"
-                for lbl, val, thr in [
-                    ("Clarity",   arg.clarity_score,    0.5),
-                    ("Reasoning", arg.reasoning_score,  0.5),
-                    ("Depth",     arg.depth_score,       0.4),
-                    ("Fluency",   arg.fluency_score_arg, 0.5),
-                ]
-            ]
-            weakest = [
-                lbl for lbl, weak in [
-                    ("clearer position statement",        arg.clarity_score < 0.5),
-                    ("logical reasoning explaining WHY",  arg.reasoning_score < 0.5),
-                    ("a concrete example or elaboration", arg.depth_score < 0.4),
-                    ("cleaner grammar and connectives",   arg.fluency_score_arg < 0.5),
-                ] if weak
-            ]
-            coaching_action.intent = "\n".join([
-                f"Topic: {topic or DEBATE_TOPICS[0]}",
-                f"Student position: {(position or 'For').lower()}",
-                f"Turn {self.turn_count}. Student just said:",
-                f'  "{transcript[:300]}"',
-                "Scores:", *dim_lines,
-                f"Coach summary: {arg.summary}",
-                f"Weakest areas: {', '.join(weakest) if weakest else 'none — strong'}",
-                f"Coach last asked: \"{self.last_coach_question}\"",
-                "Do NOT repeat or rephrase the coach's last question.",
-            ])
-
-        # ── Step 6: ResponseGenerator ─────────────────────────────────────────
-        coach_text = ""
-        if coaching_action:
-            request = ResponseRequest(
-                coaching_action=coaching_action,
-                topic=topic or DEBATE_TOPICS[0],
-                user_position=(position or "For").lower(),
-                prior_responses=list(self.prior_responses),
-                turn_number=self.turn_count,
-                retrieval_context=retrieval_ctx,
-            )
-            try:
-                response = self._run(self.response_gen.generate_response(request))
-                strategy_label = coaching_action.strategy.value.title()
-                coach_text = f"[{strategy_label}]\n\n{response.text}"
-                self.last_coach_question = response.text
-                self.prior_responses.append(response.text)
-                if len(self.prior_responses) > 5:
-                    self.prior_responses.pop(0)
-            except Exception as e:
-                logger.error(f"ResponseGenerator failed: {e}")
-                coach_text = f"[{coaching_action.strategy.value.title()}]\n\n(unavailable: {e})"
-            timer.mark("6_response_generator")
-
-        # ── Step 7: ImprovedVersion + LanguageTips PARALLEL ───────────────────
-        improved_text = ""
-        language_tips = ""
-        if coaching_action:
-            async def _parallel_secondary():
-                return await asyncio.gather(
-                    self.response_gen.generate_improved_version(
-                        original_transcript=transcript,
-                        topic=topic or DEBATE_TOPICS[0],
-                        user_position=(position or "For").lower(),
-                        vocabulary_flags=analysis.argument.vocabulary_flags,
-                    ),
-                    self.response_gen.generate_language_tips(
-                        original_transcript=transcript,
-                        improved_transcript="",
-                        vocabulary_flags=analysis.argument.vocabulary_flags,
-                        clarity_feedback=analysis.argument.clarity_feedback or "",
-                        fluency_feedback=analysis.argument.fluency_feedback or "",
-                    ),
-                    return_exceptions=True,
-                )
-
-            sec = self._run(_parallel_secondary())
-            timer.mark("7_improved+tips_parallel")
-
-            improved_text = sec[0] if not isinstance(sec[0], Exception) else ""
-            language_tips = sec[1] if not isinstance(sec[1], Exception) else ""
-            if isinstance(sec[0], Exception):
-                logger.error(f"ImprovedVersion failed: {sec[0]}")
-            if isinstance(sec[1], Exception):
-                logger.error(f"LanguageTips failed: {sec[1]}")
+        # Persist topic/position for stop_session (which runs outside pipeline)
+        self.session_topic    = topic or DEBATE_TOPICS[0]
+        self.session_position = (position or "For").lower()
 
         total = timer.summary()
-        self.session_language_tips.append(language_tips)
 
-        show_wrapup = self.turn_count >= 3
+        # Re-attach timing to status (pipeline status omits transcript_source/timing)
+        base_status = result.get("status_message", f"✅ Turn {turn_number} complete")
+        status = base_status.split(" — ")[0] + f"  ⏱ {total:.1f}s ({transcript_source})"
+        if "Choose an option" in base_status:
+            status += " — Choose an option below"
+        elif "next argument" in base_status:
+            status += " — Record your next argument above"
+
+        show_wrapup = turn_number >= 3
         if show_wrapup:
             self.in_wrapup = True
 
-        errors = analysis.pronunciation.mispronounced_words
-        pronunciation_text = (
-            "\n".join(
-                f"• {w.word}  expected: {w.expected_ipa}  actual: {w.actual_ipa}  [{w.severity.value}]"
-                for w in errors
-            ) if errors else "✓ No pronunciation issues detected"
-        )
-
-        arg   = analysis.argument
-        score = arg.argument_score
-        emoji = "🟢" if score >= 0.7 else "🟡" if score >= 0.4 else "🔴"
-        status = (
-            f"✅ Turn {self.turn_count} complete  "
-            f"{emoji} Score: {score:.2f}  "
-            f"⏱ {total:.1f}s ({transcript_source})"
-            + (" — Choose an option below" if show_wrapup
-               else " — Record your next argument above")
-        )
-
         c, n, s = self._wrapup_active(show_wrapup)
 
-        # NOTE: debate_summary_out and lang_summary_out are NOT in ALL_OUTPUTS,
-        # so this return tuple has exactly 15 items matching ALL_OUTPUTS.
-        return (
-            None,
-            transcript, coach_text, improved_text, status,
-            gr.update(value=arg.clarity_score >= 0.5,     label=f"Clarity  {arg.clarity_score:.1f}"),
-            gr.update(value=arg.reasoning_score >= 0.5,   label=f"Reasoning  {arg.reasoning_score:.1f}"),
-            gr.update(value=arg.depth_score >= 0.4,       label=f"Depth  {arg.depth_score:.1f}"),
-            gr.update(value=arg.fluency_score_arg >= 0.5, label=f"Fluency  {arg.fluency_score_arg:.1f}"),
-            language_tips, pronunciation_text,
-            c, n, s,
-            gr.update(interactive=not show_wrapup),
-        )
+        if analysis:
+            arg = analysis.argument
+            return (
+                None,
+                transcript, coach_text, improved_text, status,
+                gr.update(value=arg.clarity_score >= 0.5,     label=f"Clarity  {arg.clarity_score:.1f}"),
+                gr.update(value=arg.reasoning_score >= 0.5,   label=f"Reasoning  {arg.reasoning_score:.1f}"),
+                gr.update(value=arg.depth_score >= 0.4,       label=f"Depth  {arg.depth_score:.1f}"),
+                gr.update(value=arg.fluency_score_arg >= 0.5, label=f"Fluency  {arg.fluency_score_arg:.1f}"),
+                language_tips, pronunciation_text,
+                c, n, s,
+                gr.update(interactive=not show_wrapup),
+            )
+        else:
+            # META_QUESTION / OFF_TOPIC path — no analysis object
+            return (
+                None,
+                transcript, coach_text, improved_text, status,
+                False, False, False, False,
+                language_tips, pronunciation_text,
+                c, n, s,
+                gr.update(interactive=True),
+            )
 
-    # ── Meta-question handler ─────────────────────────────────────────────────
-    def _handle_meta_question(self, transcript: str, topic: str, position: str) -> str:
-        try:
-            dummy_action = CoachingAction(
-                strategy=CoachingStrategy.PROBE,
-                intent=(
-                    f"Coach previously asked: \"{self.last_coach_question}\"\n"
-                    f"Student pushed back: \"{transcript}\"\n"
-                    "Student is RIGHT. Acknowledge it, do NOT repeat same question, "
-                    "ask ONE new forward-moving question."
-                ),
-                target_claim=None, target_word=None, target_phoneme=None,
-                argument_score=0.0, pronunciation_score=1.0, difficulty_delta=0,
-                turn_number=self.turn_count,
-                topic=topic or DEBATE_TOPICS[0],
-                user_position=(position or "For").lower(),
-                prior_coach_responses=list(self.prior_responses),
-            )
-            req = ResponseRequest(
-                coaching_action=dummy_action,
-                topic=topic or DEBATE_TOPICS[0],
-                user_position=(position or "For").lower(),
-                prior_responses=list(self.prior_responses),
-                turn_number=self.turn_count,
-            )
-            response = self._run(self.response_gen.generate_response(req))
-            self.last_coach_question = response.text
-            return f"[Coach]\n\n{response.text}"
-        except Exception as e:
-            logger.error(f"Meta question handler failed: {e}")
-            return "[Coach]\n\nYou're right — let's move on. What specific harm can you elaborate on?"
+    # Meta-question handling is now inside pipeline.py → meta_handler_node
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────

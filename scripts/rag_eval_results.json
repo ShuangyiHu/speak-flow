@@ -1,0 +1,347 @@
+[
+  {
+    "case_id": "sm_weak",
+    "topic": "Social media does more harm than good",
+    "quality_level": "weak",
+    "strategy": "CHALLENGE",
+    "transcript": "I think social media is bad because people spend too much time on it and it's addictive.",
+    "baseline_response": "That's a starting point, but you need to prove *why* excessive time and addiction actually cause harm\u2014what are the concrete negative consequences? Also, consider: couldn't the same \"too much time\" argument apply to books, sports, or television\u2014so what makes social media *uniquely* harmful? Push deeper into specific harms like mental health impacts, misinformation spread, or cyberbullying rather than stopping at \"people use it a lot.\"",
+    "rag_response": "Your point about addiction is worth exploring, but can you explain *why* spending time on social media is inherently harmful? Someone could argue people spend lots of time reading books or exercising too - what makes social media time specifically damaging rather than just a personal choice about how to spend leisure time?",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Directly addresses the argument's weakness, names specific concrete harms (mental health, misinformation, cyberbullying) the student could research, and provides a clear counterargument framework to anticipate."
+    },
+    "rag_scores": {
+      "relevance": 4,
+      "specificity": 2,
+      "actionability": 3,
+      "brief_reason": "Challenges the core claim effectively but remains generic, offering no specific evidence types or concrete harm categories despite having access to a knowledge base that should provide those details."
+    },
+    "delta": -5.0,
+    "error": null
+  },
+  {
+    "case_id": "sm_medium",
+    "topic": "Social media does more harm than good",
+    "quality_level": "medium",
+    "strategy": "PROBE",
+    "transcript": "Social media harms society because it spreads misinformation rapidly. For example, during COVID-19 fake cures went viral and people were misled.",
+    "baseline_response": "Good start with a concrete example, but let's probe deeper: **Why** does social media spread misinformation more rapidly than traditional media, and **what specific features** of these platforms make fake cures go viral? Can you identify the underlying mechanisms\u2014like algorithms, echo chambers, or lack of fact-checking\u2014that make this harm unique to social media rather than just a problem with any information source?",
+    "rag_response": "Good specific example with COVID-19 misinformation! Now probe deeper: What makes social media *uniquely* harmful compared to traditional media that also spreads misinformation? Ask yourself whether the speed of spread, the algorithmic amplification, or the lack of gatekeepers is the real issue\u2014this will help you defend against opponents who argue misinformation existed long before social media.",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 4,
+      "brief_reason": "Directly addresses the misinformation claim with specific probing questions about mechanisms (algorithms, echo chambers, fact-checking) that guide the student toward stronger argumentation."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 3,
+      "actionability": 5,
+      "brief_reason": "Highly relevant and actionable by identifying the exact comparative weakness and anticipating opponent responses, though slightly less specific about concrete mechanisms than baseline."
+    },
+    "delta": 0.0,
+    "error": null
+  },
+  {
+    "case_id": "sm_strong",
+    "topic": "Social media does more harm than good",
+    "quality_level": "strong",
+    "strategy": "CHALLENGE",
+    "transcript": "Social media has been essential for political organizing in authoritarian contexts \u2014 the Arab Spring demonstrated how platforms enabled coordination that state media suppressed. The harm framing ignores asymmetric access to information.",
+    "baseline_response": "Your argument assumes the Arab Spring's outcomes validate social media's role, but most of those movements either failed or led to worse conditions \u2014 can you defend a tool as doing \"more good than harm\" when its most celebrated political use case resulted in civil wars in Syria and Libya, continued authoritarianism in Egypt, and only one partial democracy in Tunisia? Additionally, those same platforms you credit have since been weaponized by authoritarian regimes for surveillance and disinformation, so the \"asymmetric access\" now cuts both ways \u2014 how do you account for that reversal?",
+    "rag_response": "Your Arab Spring example is actually vulnerable to challenge \u2014 while social media initially enabled coordination, authoritarian regimes quickly adapted by using those same platforms for surveillance, disinformation, and identifying dissidents, which arguably caused more harm to those movements than good. You need to anticipate that your opponent will point out that the Egyptian and Syrian governments leveraged social media to suppress dissent, and prepare a response about whether temporary coordination benefits outweigh long-term authoritarian adaptation.",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 5,
+      "actionability": 4,
+      "brief_reason": "Directly challenges the Arab Spring example with specific country outcomes (Syria, Libya, Egypt, Tunisia) and platform weaponization, though the question format could be slightly more directive about what to do next."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Directly addresses the Arab Spring vulnerability with concrete examples (Egyptian and Syrian government responses) and explicitly tells the student to prepare a response about temporary vs. long-term harms, making it immediately actionable."
+    },
+    "delta": 0.0,
+    "error": null
+  },
+  {
+    "case_id": "ai_weak",
+    "topic": "AI will take more jobs than it creates",
+    "quality_level": "weak",
+    "strategy": "PROBE",
+    "transcript": "AI is going to take everyone's jobs because robots are getting smarter every day.",
+    "baseline_response": "That's a broad claim - let's probe deeper into the specifics. Which sectors or job types do you think will be hit first and hardest, and what evidence can you point to that shows AI is already displacing more workers than it's creating new opportunities for? Also, when you say \"everyone's jobs,\" are there certain professions you think might actually be resistant to AI replacement?",
+    "rag_response": "Your opening is too broad and absolute\u2014saying AI will take \"everyone's jobs\" is an exaggeration that opponents will easily attack with counterexamples. Instead, probe deeper into *which sectors* are most vulnerable and *why* the pace of job displacement might outstrip job creation\u2014for example, can you identify specific categories of work where automation is advancing faster than new roles are emerging?",
+    "baseline_scores": {
+      "relevance": 4,
+      "specificity": 3,
+      "actionability": 4,
+      "brief_reason": "Directly addresses the argument's weaknesses with relevant questions about sectors and evidence, but remains at a general conceptual level without concrete debate tools or examples."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Precisely targets the logical flaw ('everyone's jobs' being too absolute), names the strategic vulnerability opponents will exploit, and provides a clear reframing strategy with specific analytical directions (sector vulnerability, pace comparison)."
+    },
+    "delta": 3.0,
+    "error": null
+  },
+  {
+    "case_id": "ai_medium",
+    "topic": "AI will take more jobs than it creates",
+    "quality_level": "medium",
+    "strategy": "CHALLENGE",
+    "transcript": "History shows that new technology creates new jobs. The industrial revolution eliminated farm jobs but created factory jobs. AI will be the same \u2014 new roles in AI maintenance and data work will emerge.",
+    "baseline_response": "Your historical parallel is too simplistic\u2014the industrial revolution took over a century to rebalance employment, causing massive social upheaval in the transition, and those factory jobs required human physical labor that machines couldn't replicate. What happens when AI can not only do the jobs it eliminates but also perform most of the \"new\" jobs like AI maintenance and data analysis better than humans can? You need to address why this technological shift won't be fundamentally different from previous ones where humans still had comparative advantages.",
+    "rag_response": "Your historical analogy is actually vulnerable here\u2014the industrial revolution took decades to create replacement jobs and caused massive social upheaval, which doesn't support your optimistic timeline. More critically, you're assuming AI will follow the same pattern when it's fundamentally different: past technology augmented physical labor, but AI can potentially replace cognitive work itself, including those \"AI maintenance\" jobs you mention. Challenge yourself to explain *why* this technological shift won't be uniquely disruptive compared to previous ones.",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 4,
+      "brief_reason": "Directly challenges the historical analogy with concrete questions about comparative advantage and AI's unique capability to replace its own maintenance roles, giving the student a clear counter-argument to address."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 3,
+      "actionability": 3,
+      "brief_reason": "Equally relevant in challenging the historical analogy and identifies the physical vs. cognitive labor distinction, but remains slightly more general and doesn't push as hard on the specific vulnerability of the student's 'AI maintenance jobs' example."
+    },
+    "delta": -2.0,
+    "error": null
+  },
+  {
+    "case_id": "ai_strong",
+    "topic": "AI will take more jobs than it creates",
+    "quality_level": "strong",
+    "strategy": "PROBE",
+    "transcript": "The key distinction is cognitive vs physical labor. Previous automation targeted physical tasks, creating demand for cognitive workers. AI targets cognitive tasks directly, which eliminates the traditional escape valve. McKinsey estimates 375 million workers may need to switch occupations by 2030.",
+    "baseline_response": "Your McKinsey statistic is powerful, but probe deeper into *why* cognitive automation is fundamentally different\u2014what happens when the \"escape valve\" closes and there's no higher category of work for displaced workers to move into? Challenge your opponent by asking: if 375 million workers need to switch occupations, what specific occupations are they switching *to* if AI is simultaneously automating cognitive tasks across all sectors?",
+    "rag_response": "Your cognitive vs. physical distinction is strong, but probe deeper into *why* this time is fundamentally different\u2014specifically, ask what new jobs could emerge that AI *cannot* do, and force your opponent to explain the mechanism by which 375 million displaced workers will be retrained and absorbed. Challenge them to show historical precedent for retraining at this scale and speed, because without that mechanism, the McKinsey statistic actually reinforces your position rather than just stating a problem.",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Directly addresses the argument's core logic about the 'escape valve' and provides a concrete strategic question to deploy immediately."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Equally relevant to the specific argument, adds the retraining mechanism angle and historical precedent challenge, providing clear tactical moves."
+    },
+    "delta": 0.0,
+    "error": null
+  },
+  {
+    "case_id": "climate_weak",
+    "topic": "Climate change policy should prioritise economic growth",
+    "quality_level": "weak",
+    "strategy": "REDIRECT",
+    "transcript": "I think we need to focus on the economy because people need money to live. Climate is important but jobs come first.",
+    "baseline_response": "Good instinct linking this to people's livelihoods, but let's redirect that economic argument *toward* climate action: reframe it as \"investing in green technology and renewable energy creates millions of high-paying jobs while growing GDP\u2014so we're not choosing between economy and climate, we're choosing the smartest path to economic growth.\" This way, you're still prioritizing economic growth as your position requires, but showing that climate policy *is* the economic policy. Can you try restating your opening with that redirect?",
+    "rag_response": "Your instinct to connect this to people's real needs is good, but instead of presenting economy and climate as competing priorities, redirect to show they're aligned: argue that investing in green technology and renewable energy *creates* high-quality jobs and economic growth, making climate action the smart economic choice. This reframing is more persuasive because it doesn't ask people to choose between their livelihood and the environment\u2014it shows how addressing climate change can strengthen both.",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Directly addresses the student's economy-vs-climate framing, provides concrete reframing language with specific examples (green technology, renewable energy, GDP), and explicitly asks the student to restate their opening."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 3,
+      "actionability": 4,
+      "brief_reason": "Equally relevant to the student's argument and provides the same core redirect strategy, but less specific in execution (no GDP reference, no concrete phrasing to adopt) and slightly less actionable (suggests the approach but doesn't explicitly prompt immediate practice)."
+    },
+    "delta": -2.0,
+    "error": null
+  },
+  {
+    "case_id": "climate_medium",
+    "topic": "Climate change policy should prioritise economic growth",
+    "quality_level": "medium",
+    "strategy": "CHALLENGE",
+    "transcript": "Prioritising growth over climate is short-sighted. The economic costs of climate change \u2014 flooding, crop failure, displacement \u2014 will far exceed the cost of mitigation. The Stern Review estimated inaction costs 20 times more than action.",
+    "baseline_response": "Your Stern Review statistic is powerful, but you need to preempt the opposition's counterargument: they'll claim we can have *both* growth and climate action, or that green technology itself drives economic growth. Challenge them directly by explaining why \"prioritizing economic growth\" in practice means fossil fuel dependence and delayed action\u2014force them to defend what growth-first policies actually look like in the real world.",
+    "rag_response": "Your Stern Review reference is strong, but you need to preempt the obvious counterargument: opponents will claim that aggressive climate policies will crush developing economies and trap billions in poverty *right now*. Challenge yourself to directly address why short-term economic sacrifice won't disproportionately harm the world's poorest, or reframe to show how green transition can actually drive growth rather than hinder it.",
+    "baseline_scores": {
+      "relevance": 4,
+      "specificity": 3,
+      "actionability": 4,
+      "brief_reason": "Directly addresses the argument's vulnerability by identifying the 'both/and' counterargument, provides a clear strategic direction (force opponents to defend real-world policies), but lacks concrete examples or evidence to reference."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 4,
+      "brief_reason": "Highly relevant by identifying the specific developing economies/poverty trap counterargument, offers two concrete strategic paths (address harm or reframe around green growth), and directly challenges the student's framing with a more sophisticated counter they must prepare for."
+    },
+    "delta": 2.0,
+    "error": null
+  },
+  {
+    "case_id": "climate_strong",
+    "topic": "Climate change policy should prioritise economic growth",
+    "quality_level": "strong",
+    "strategy": "PROBE",
+    "transcript": "In developing nations, this is not a hypothetical tradeoff \u2014 it is a present reality. India cannot simultaneously decarbonise at the pace Western nations demand and lift 300 million people out of energy poverty. Climate justice requires acknowledging who bears the transition costs.",
+    "baseline_response": "That's a compelling equity framing, but I'd probe deeper: if India prioritizes short-term coal expansion for energy access, how do you address that the poorest Indians will be *most* vulnerable to the droughts, floods, and agricultural collapse that delayed action makes inevitable? Doesn't true climate justice require preventing catastrophic harm to those same 300 million people, even if transition costs are front-loaded?",
+    "rag_response": "Your argument about India's energy poverty is compelling, but I need you to probe deeper: what specific economic growth rate or energy access milestone would justify delaying decarbonisation, and at what point does climate damage itself start reversing those economic gains? Push yourself to quantify the tradeoff you're defending\u2014without concrete thresholds, you're vulnerable to opponents who'll argue that unchecked emissions will devastate the very economies you're trying to protect.",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 4,
+      "brief_reason": "Directly challenges the core tension in the student's argument with a concrete counter-scenario (droughts/floods affecting the same population), offering a clear line of inquiry to pursue."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 3,
+      "actionability": 5,
+      "brief_reason": "Precisely targets the argument's vulnerability by demanding quantification and thresholds, giving the student an immediately executable task (define metrics and tipping points) that strengthens their position."
+    },
+    "delta": 0.0,
+    "error": null
+  },
+  {
+    "case_id": "test_weak",
+    "topic": "Standardised testing is an effective measure of student ability",
+    "quality_level": "weak",
+    "strategy": "PROBE",
+    "transcript": "Standardised tests are unfair because some students are just bad at taking tests even if they are smart.",
+    "baseline_response": "That's a common concern, but let's probe deeper: *what specifically* makes those students \"bad at taking tests\"? Is it test anxiety, time pressure, the multiple-choice format, or something else\u2014and if we can identify the exact barrier, does that mean the test itself is flawed, or that we need better support systems to help students demonstrate their knowledge under standard conditions?",
+    "rag_response": "Good point about test anxiety, but let's probe deeper: *what specific evidence* can you provide that test performance doesn't correlate with actual ability? Can you explain the mechanism\u2014is it that smart students lack test-taking skills that could be taught, or is there something inherent about the standardized format that fails to capture certain types of intelligence?",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Directly addresses the test anxiety claim with concrete barriers to explore (anxiety, time pressure, format) and poses a strategic question about whether the flaw lies in the test or support systems."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 3,
+      "actionability": 4,
+      "brief_reason": "Directly probes the argument and introduces useful concepts (correlation with ability, teachable skills, types of intelligence) but doesn't reference specific evidence or studies despite claiming RAG enhancement."
+    },
+    "delta": -2.0,
+    "error": null
+  },
+  {
+    "case_id": "test_medium",
+    "topic": "Standardised testing is an effective measure of student ability",
+    "quality_level": "medium",
+    "strategy": "CHALLENGE",
+    "transcript": "Without standardised tests we have no common benchmark. Teacher grades are subjective and vary by school quality. A test score allows fair comparison across different school systems.",
+    "baseline_response": "Your argument assumes that a single test score is more objective than teacher assessment, but what if standardized tests themselves are biased\u2014favoring students from wealthier backgrounds who can afford test prep, or containing cultural assumptions that disadvantage certain groups? If the \"common benchmark\" systematically produces different results based on zip code and family income rather than actual ability, is it really fairer than local teacher evaluation?",
+    "rag_response": "Your argument assumes that standardization automatically equals fairness, but you need to address the counter-argument that standardized tests may systematically disadvantage certain groups due to cultural bias, test-taking anxiety, or unequal access to test preparation resources. Challenge yourself: if a benchmark consistently produces different results based on socioeconomic status rather than actual ability, is it truly a \"fair comparison\"? Strengthen your case by either acknowledging these limitations and explaining why the benefits outweigh them, or by providing evidence that modern standardized tests have successfully mitigated these biases.",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 3,
+      "actionability": 3,
+      "brief_reason": "Directly challenges the student's fairness claim with concrete counter-examples (wealth, test prep, zip code) but doesn't provide specific evidence or clear next steps for strengthening the argument."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Directly addresses the fairness assumption with multiple specific mechanisms of bias (cultural bias, test anxiety, unequal access) and provides two concrete strategic options the student can immediately pursue in their next response."
+    },
+    "delta": 3.0,
+    "error": null
+  },
+  {
+    "case_id": "test_strong",
+    "topic": "Standardised testing is an effective measure of student ability",
+    "quality_level": "strong",
+    "strategy": "CHALLENGE",
+    "transcript": "The SAT has a 0.53 correlation with first-year GPA, which means it explains only 28% of variance in academic performance. Meanwhile, high school GPA, which tests dismiss as subjective, has a 0.56 correlation. The psychometric case for standardised testing over longitudinal assessment is weak.",
+    "baseline_response": "Your statistics actually undermine your position\u2014a 0.53 correlation is considered moderately strong in educational research, and you've just shown that standardized tests perform nearly as well as four years of high school grades while taking only a few hours. Instead of dismissing this as \"weak,\" you need to explain why a measure that captures 28% of variance in a single sitting should be abandoned, especially when your alternative only captures 3% more variance despite being far more resource-intensive and susceptible to grade inflation across thousands of different schools.",
+    "rag_response": "Your statistical argument is solid, but you're inadvertently strengthening your opponent's case by showing the SAT has *nearly equivalent* predictive power to GPA (0.53 vs 0.56 is minimal difference). Instead of comparing correlations, challenge the premise entirely: argue that *any* single metric reducing student ability to a number is fundamentally flawed, and that standardised tests are particularly pernicious because they claim objectivity while actually measuring test-taking skills and socioeconomic access to preparation.",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 3,
+      "brief_reason": "Directly addresses the student's statistical claim and identifies the logical trap, but doesn't provide a clear alternative argumentative path forward beyond defending the existing statistics."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Identifies the same strategic weakness while immediately pivoting to a concrete reframing strategy (attacking the premise of quantification itself) that the student can execute in their next turn."
+    },
+    "delta": 2.0,
+    "error": null
+  },
+  {
+    "case_id": "ubi_weak",
+    "topic": "Universal basic income should be implemented globally",
+    "quality_level": "weak",
+    "strategy": "PROBE",
+    "transcript": "UBI is a good idea because everyone deserves money to survive and it would end poverty.",
+    "baseline_response": "Your claim needs more depth - can you explain *why* everyone deserves survival income as a right, and what evidence suggests UBI would actually end poverty rather than just redistribute it? Also, consider potential counterarguments: what happens to poverty if UBI causes inflation or if the guaranteed income discourages work in ways that shrink the overall economy?",
+    "rag_response": "Your claim is very broad - let's probe deeper into the mechanics. Can you explain *how* UBI would end poverty when people still face different costs of living globally, and what evidence suggests that simply providing money addresses the root causes of poverty like lack of education, healthcare access, or job opportunities? Also, what do you mean by \"deserves\" - is this a moral argument, an economic one, or both?",
+    "baseline_scores": {
+      "relevance": 4,
+      "specificity": 3,
+      "actionability": 4,
+      "brief_reason": "Directly challenges the poverty claim with concrete concerns (inflation, work disincentives) but uses general economic concepts rather than specific evidence or debate frameworks."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Laser-focused on the poverty mechanism with specific challenges (cost of living variation, root causes vs. symptoms) and clearly separates moral from economic reasoning, giving multiple concrete paths forward."
+    },
+    "delta": 3.0,
+    "error": null
+  },
+  {
+    "case_id": "ubi_medium",
+    "topic": "Universal basic income should be implemented globally",
+    "quality_level": "medium",
+    "strategy": "CHALLENGE",
+    "transcript": "UBI is fiscally unviable at meaningful scale. Giving every US adult $12,000 per year would cost $3 trillion annually, which exceeds the entire discretionary budget. Targeted programmes achieve the same poverty reduction at a fraction of the cost.",
+    "baseline_response": "Your fiscal argument is strong, but you're vulnerable to the rebuttal that UBI *replaces* existing welfare programs (Social Security, SNAP, unemployment, etc. total ~$1.1 trillion) rather than adding to them, which dramatically changes your math. You need to either pre-emptively address this consolidation argument by showing the net cost after eliminating redundant programs, or shift your framing to argue why we shouldn't eliminate those targeted programs in the first place.",
+    "rag_response": "Your fiscal calculation is strong, but you're vulnerable to the counter that UBI could replace existing welfare programs\u2014challenge yourself by addressing whether administrative savings and consolidation of benefits could offset costs. Also, anticipate the rebuttal that funding mechanisms like VAT, wealth taxes, or carbon taxes could make UBI viable without increasing net government spending. Preemptively address these financing alternatives to prevent your opponent from undermining your cost argument.",
+    "baseline_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 5,
+      "brief_reason": "Directly addresses the student's cost argument with a specific $1.1 trillion figure for existing welfare programs and provides two clear strategic options for the next turn."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 3,
+      "actionability": 4,
+      "brief_reason": "Addresses the same vulnerability but lists multiple funding mechanisms without concrete data, making it slightly less actionable than providing a specific path forward with numbers."
+    },
+    "delta": -2.0,
+    "error": null
+  },
+  {
+    "case_id": "ubi_strong",
+    "topic": "Universal basic income should be implemented globally",
+    "quality_level": "strong",
+    "strategy": "PROBE",
+    "transcript": "The fiscal objection conflates gross cost with net cost. A UBI replacing existing means-tested programmes, funded by a VAT or wealth tax, can be revenue-neutral while eliminating the poverty trap \u2014 the marginal effective tax rate cliff that currently makes low-wage work economically irrational for welfare recipients.",
+    "baseline_response": "Good technical framing, but you've packed three complex economic mechanisms into one sentence without unpacking any of them. Can you walk me through a concrete numerical example showing how a welfare recipient currently faces this \"poverty trap,\" then demonstrate step-by-step how UBI eliminates it while remaining revenue-neutral? This will force your opponent to engage with the actual math rather than dismiss it as theoretical.",
+    "rag_response": "Your revenue-neutrality claim is strong, but you need to probe deeper into *which* existing programmes would be replaced and whether their current beneficiaries would actually be better off under UBI. Can you specify the exact marginal effective tax rates you're referring to in the poverty trap, and demonstrate with a concrete example how your proposed funding mechanism (VAT vs. wealth tax\u2014pick one for clarity) would maintain progressivity while eliminating that cliff?",
+    "baseline_scores": {
+      "relevance": 4,
+      "specificity": 3,
+      "actionability": 5,
+      "brief_reason": "Directly addresses the argument's core claims about poverty trap and revenue-neutrality, gives clear concrete action (numerical example), though doesn't reference specific debate terminology or evidence."
+    },
+    "rag_scores": {
+      "relevance": 5,
+      "specificity": 4,
+      "actionability": 4,
+      "brief_reason": "Laser-focused on the exact claims made, identifies the specific gap (which programs, actual METR rates), requests concrete demonstration, and flags the VAT/wealth tax ambiguity that weakens the argument."
+    },
+    "delta": 1.0,
+    "error": null
+  }
+]

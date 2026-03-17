@@ -111,9 +111,9 @@ class TestCoachPolicyAgent:
     async def test_decide_completes_within_timeout(self, agent, sample_analysis, sample_context, mock_anthropic):
         mock_anthropic.messages.create.return_value = Mock(content=[Mock(text="What evidence supports that claim?")])
         
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.().time()
         result = await agent.decide(sample_analysis, sample_context)
-        end_time = asyncio.get_event_loop().time()
+        end_time = asyncio.().time()
         
         assert (end_time - start_time) < 10.0
         assert isinstance(result, CoachingAction)

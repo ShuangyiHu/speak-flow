@@ -1,3 +1,31 @@
+⚠️  UI DESIGN IS FROZEN — DO NOT MODIFY LAYOUT WITHOUT EXPLICIT APPROVAL ⚠️
+
+Architecture:
+  All per-turn orchestration (Steps 3-7) is now delegated to pipeline.py
+  (LangGraph StateGraph). app.py is responsible only for UI and session
+  lifecycle — not for wiring modules together.
+
+  pipeline.ainvoke() runs the full graph per turn:
+    intent_node → fan-out [score_node ‖ summary_node ‖ pronunciation_node]
+    → merge_analysis_node → [coach_policy_node ‖ rag_node] → response_node
+    → update_session_node
+
+  Session state (prior_turns, coaching_history, argument_scores, etc.) is
+  persisted by LangGraph MemorySaver, keyed by thread_id = session_id.
+  reset_session() uses a new thread_id to start a clean slate.
+
+Key UI decisions:
+  - Wrapup buttons always rendered, start as interactive=False (Gradio 6.x
+    visible= updates on hidden components are unreliable).
+  - debate_summary_out / lang_summary_out excluded from ALL_OUTPUTS to
+    prevent loading spinners during per-turn analysis.
+  - stop_session generates summaries via direct AsyncAnthropic calls (45s).
+  - PronunciationCoach runs AFTER pipeline.ainvoke(), using turn_analysis
+    from pipeline result. In stub MFA mode, mispronounced_words is always
+    empty so PronunciationCoach returns instantly with no LLM call.
+"""
+
+import asyncio
 import os
 import gradio as gr
 import asyncio

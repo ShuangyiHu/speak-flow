@@ -80,7 +80,7 @@ class PronunciationCoach:
             
         Timeout: 2.8 seconds via asyncio.wait_for
         """
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.get_running_loop().time()
         
         try:
             timeout_task = self._generate_feedback_impl(
@@ -94,7 +94,7 @@ class PronunciationCoach:
                 return await asyncio.wait_for(timeout_task, timeout=2.8)
                 
         except asyncio.TimeoutError:
-            latency_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            latency_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
             return PronunciationFeedback(
                 corrections=[],
                 drill_sentence="",
@@ -104,7 +104,7 @@ class PronunciationCoach:
                 latency_ms=latency_ms
             )
         except (OSError, ConnectionError) as e:
-            latency_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            latency_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
             return PronunciationFeedback(
                 corrections=[],
                 drill_sentence="",
@@ -114,7 +114,7 @@ class PronunciationCoach:
                 latency_ms=latency_ms
             )
         except (json.JSONDecodeError, ValueError) as e:
-            latency_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            latency_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
             return PronunciationFeedback(
                 corrections=[],
                 drill_sentence="",
@@ -124,7 +124,7 @@ class PronunciationCoach:
                 latency_ms=latency_ms
             )
         except Exception as e:
-            latency_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            latency_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
             return PronunciationFeedback(
                 corrections=[],
                 drill_sentence="",
@@ -151,7 +151,7 @@ class PronunciationCoach:
                 if pronunciation_result.fluency_score >= 0.7 
                 else "Try to speak a bit more smoothly — aim for fewer pauses."
             )
-            latency_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+            latency_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
             return PronunciationFeedback(
                 corrections=[],
                 drill_sentence="",
@@ -162,8 +162,13 @@ class PronunciationCoach:
             )
         
         # Filter to top 3 errors by severity
-        errors = sorted(pronunciation_result.mispronounced_words, 
-                      key=lambda x: (x.severity.value if hasattr(x.severity, 'value') else 0, x.word))[:3]
+        _SEVERITY_PRIORITY = {"high": 3, "medium": 2, "low": 1}
+        errors = sorted(
+            pronunciation_result.mispronounced_words,
+            key=lambda x: -_SEVERITY_PRIORITY.get(
+                x.severity.value if hasattr(x.severity, "value") else "low", 0
+            ),
+        )[:3]
         
         # Generate corrections and drill sentence concurrently
         corrections_task = self._generate_corrections(errors, transcript)
@@ -183,7 +188,7 @@ class PronunciationCoach:
         # Build overall message
         overall_message = "Great effort! Let's work on a few pronunciation details to make your speech even clearer."
         
-        latency_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
+        latency_ms = int((asyncio.get_running_loop().time() - start_time) * 1000)
         
         return PronunciationFeedback(
             corrections=corrections,

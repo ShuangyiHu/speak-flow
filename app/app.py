@@ -1,5 +1,5 @@
 """
-app.py — SpeakFlow AI Gradio frontend  (v9)
+app.py — SpeakFlow AI Gradio frontend  (v10)
 ============================================
 ⚠️  UI DESIGN IS FROZEN — DO NOT MODIFY LAYOUT WITHOUT EXPLICIT APPROVAL ⚠️
 
@@ -23,6 +23,9 @@ Key UI decisions:
   - debate_summary_out / lang_summary_out excluded from ALL_OUTPUTS to
     prevent loading spinners during per-turn analysis.
   - stop_session generates summaries via direct AsyncAnthropic calls (45s).
+  - PronunciationCoach runs AFTER pipeline.ainvoke(), using turn_analysis
+    from pipeline result. In stub MFA mode, mispronounced_words is always
+    empty so PronunciationCoach returns instantly with no LLM call.
 """
 
 import asyncio
@@ -36,6 +39,7 @@ from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 from pipeline import SpeakFlowPipeline
+from pronunciation_coach import PronunciationCoach
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,18 +121,40 @@ class StepTimer:
         return total
 
 
+# ── Pronunciation text formatter ──────────────────────────────────────────────
+def _format_pronunciation_feedback(feedback) -> str:
+    """
+    Convert PronunciationFeedback → display string for pronunciation_out textbox.
+    Called only when PronunciationCoach returns a real result.
+    """
+    lines = [feedback.overall_message]
+
+    if feedback.has_errors:
+        for c in feedback.corrections:
+            lines.append(f"\n• {c.word}  [{c.severity.value}]")
+            lines.append(f"  ↳ {c.correction_tip}")
+            lines.append(f"  e.g. \"{c.model_sentence}\"")
+        if feedback.drill_sentence:
+            lines.append(f"\n🗣 Drill: {feedback.drill_sentence}")
+
+    lines.append(f"\n{feedback.fluency_comment}")
+    return "\n".join(lines)
+
+
 # ── State class ───────────────────────────────────────────────────────────────
 class SpeakFlowUI:
     def __init__(self):
         # Pipeline owns all module instances internally (TurnAnalyzer,
         # CoachPolicyAgent, ResponseGenerator, RAGRetriever).
         # ResponseGenerator is still exposed for stop_session summaries.
-        self.pipeline    = SpeakFlowPipeline()
-        self.response_gen = self.pipeline._response_gen   # reuse for stop_session
-        self._session_id  = "gradio-session-0"            # rotated on reset
+        self.pipeline           = SpeakFlowPipeline()
+        self.response_gen       = self.pipeline._response_gen   # reuse for stop_session
+        self.pronunciation_coach = PronunciationCoach(
+            anthropic_api_key=ANTHROPIC_API_KEY
+        )
+        self._session_id  = "gradio-session-0"
 
         # Local state: only what pipeline.py does NOT persist
-        # (session topic/position for stop_session, wrapup flag for UI gating)
         self.session_topic: str    = ""
         self.session_position: str = ""
         self.in_wrapup: bool       = False
@@ -153,9 +179,8 @@ class SpeakFlowUI:
 
     # ── Reset ─────────────────────────────────────────────────────────────────
     def reset_session(self):
-        # Rotate session_id so MemorySaver starts a clean checkpoint thread.
         import uuid
-        self._session_id   = f"gradio-session-{uuid.uuid4().hex[:8]}"
+        self._session_id      = f"gradio-session-{uuid.uuid4().hex[:8]}"
         self.session_topic    = ""
         self.session_position = ""
         self.in_wrapup        = False
@@ -166,12 +191,10 @@ class SpeakFlowUI:
             False, False, False, False, "", "",
             c, n, s,
             gr.update(interactive=True),
-            "", "",           # clear summary textboxes
+            "", "",
         )
 
     def continue_session(self):
-        # Keep same session_id — MemorySaver will restore state from the
-        # checkpoint. Pipeline turn_number continues from where it left off.
         self.in_wrapup = False
         c, n, s = self._wrapup_active(False)
         return (
@@ -180,7 +203,7 @@ class SpeakFlowUI:
             False, False, False, False, "", "",
             c, n, s,
             gr.update(interactive=True),
-            "", "",           # clear summary textboxes
+            "", "",
         )
 
     # ── stop_session ──────────────────────────────────────────────────────────
@@ -196,7 +219,6 @@ class SpeakFlowUI:
         debate_summary = "Great session! You built up your argument well across the turns."
         lang_summary   = "Keep practising connectors like 'therefore' and 'however'."
 
-        # Read session history from pipeline MemorySaver checkpoint
         config = {"configurable": {"thread_id": self._session_id}}
         session_state = self.pipeline.get_session_state(config)
         session_transcripts   = session_state.get("session_transcripts")   or []
@@ -274,7 +296,7 @@ class SpeakFlowUI:
 
     # ── Main analysis ─────────────────────────────────────────────────────────
     def analyze_turn(self, audio_file, typed_transcript, topic, position):
-        timer = StepTimer(1)  # turn number tracked by pipeline, use 1 as placeholder
+        timer = StepTimer(1)
 
         if self.in_wrapup:
             c, n, s = self._wrapup_active(True)
@@ -316,19 +338,14 @@ class SpeakFlowUI:
             )
 
         # ── Steps 2-7: delegated to LangGraph pipeline ───────────────────────
-        # pipeline.ainvoke() runs the full graph:
-        #   intent_node → [score_node ‖ summary_node ‖ pronunciation_node]
-        #   → merge_analysis_node → [coach_policy_node ‖ rag_node]
-        #   → response_node → update_session_node
-        # Session state is persisted by MemorySaver (thread_id = session_id).
         config = {"configurable": {"thread_id": self._session_id}}
         try:
             result = self._run(self.pipeline.ainvoke({
-                "transcript":   transcript,
-                "topic":        topic or DEBATE_TOPICS[0],
+                "transcript":    transcript,
+                "topic":         topic or DEBATE_TOPICS[0],
                 "user_position": (position or "For").lower(),
-                "session_id":   self._session_id,
-                "audio_path":   audio_file or "",
+                "session_id":    self._session_id,
+                "audio_path":    audio_file or "",
             }, config=config))
             timer.mark("pipeline_ainvoke")
         except Exception as e:
@@ -342,20 +359,44 @@ class SpeakFlowUI:
             )
 
         # ── Extract outputs from pipeline state ───────────────────────────────
-        coach_text        = result.get("coach_text", "")
-        improved_text     = result.get("improved_text", "")
-        language_tips     = result.get("language_tips", "")
-        pronunciation_text = result.get("pronunciation_text", "✓ No pronunciation issues detected")
-        turn_number       = result.get("turn_number", 1)
-        analysis          = result.get("turn_analysis")
+        coach_text    = result.get("coach_text", "")
+        improved_text = result.get("improved_text", "")
+        language_tips = result.get("language_tips", "")
+        turn_number   = result.get("turn_number", 1)
+        analysis      = result.get("turn_analysis")
 
-        # Persist topic/position for stop_session (which runs outside pipeline)
+        # ── Step 8: Pronunciation coaching (post-pipeline) ────────────────────
+        # In stub MFA mode: analysis.pronunciation.mispronounced_words == []
+        # → PronunciationCoach returns instantly with no LLM call.
+        # When real MFA is integrated: pipeline will populate mispronounced_words
+        # and this step will call Claude for correction tips.
+        pronunciation_text = result.get(
+            "pronunciation_text", "✓ No pronunciation issues detected"
+        )
+        if analysis is not None:
+            try:
+                pron_feedback = self._run(
+                    self.pronunciation_coach.generate_feedback(
+                        pronunciation_result=analysis.pronunciation,
+                        transcript=transcript,
+                        topic=topic or DEBATE_TOPICS[0],
+                    )
+                )
+                pronunciation_text = _format_pronunciation_feedback(pron_feedback)
+                timer.mark("8_pronunciation_coach")
+                logger.info(
+                    f"[PRONUNCIATION] has_errors={pron_feedback.has_errors} "
+                    f"latency={pron_feedback.latency_ms}ms"
+                )
+            except Exception as e:
+                logger.error(f"PronunciationCoach failed: {e}")
+                # Keep the pipeline fallback text — do not crash the turn
+
         self.session_topic    = topic or DEBATE_TOPICS[0]
         self.session_position = (position or "For").lower()
 
         total = timer.summary()
 
-        # Re-attach timing to status (pipeline status omits transcript_source/timing)
         base_status = result.get("status_message", f"✅ Turn {turn_number} complete")
         status = base_status.split(" — ")[0] + f"  ⏱ {total:.1f}s ({transcript_source})"
         if "Choose an option" in base_status:
@@ -383,7 +424,6 @@ class SpeakFlowUI:
                 gr.update(interactive=not show_wrapup),
             )
         else:
-            # META_QUESTION / OFF_TOPIC path — no analysis object
             return (
                 None,
                 transcript, coach_text, improved_text, status,
@@ -392,8 +432,6 @@ class SpeakFlowUI:
                 c, n, s,
                 gr.update(interactive=True),
             )
-
-    # Meta-question handling is now inside pipeline.py → meta_handler_node
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -472,16 +510,14 @@ def create_interface():
                 placeholder="Language patterns will appear here after you stop the session.",
             )
 
-        gr.Markdown("### Pronunciation Feedback")
-        gr.Markdown("_⚠️ Pronunciation analysis is currently in stub mode (MFA not yet integrated)._")
+        gr.Markdown("### 🗣 Pronunciation Feedback")
         pronunciation_out = gr.Textbox(
-            label="Mispronounced Words (IPA)", lines=2, interactive=False)
+            label="Pronunciation Coaching",
+            lines=4, interactive=False,
+            placeholder="Pronunciation feedback will appear here after each turn.\n"
+                        "(Currently in stub mode — feedback activates when MFA is integrated.)",
+        )
 
-        # ALL_OUTPUTS: used by analyze_turn, reset_session, continue_session.
-        # debate_summary_out and lang_summary_out are intentionally EXCLUDED —
-        # they are only ever written by stop_session via STOP_OUTPUTS.
-        # Including them here would cause Gradio to show a loading spinner on
-        # every analyze_turn call, even though analyze_turn never touches them.
         ALL_OUTPUTS = [
             audio_input,          # 0
             transcript_out,       # 1
@@ -494,13 +530,12 @@ def create_interface():
             score_out,            # 8
             summary_out,          # 9
             pronunciation_out,    # 10
-            continue_btn,         # 11  ← interactive= toggled
-            new_topic_btn,        # 12  ← interactive= toggled
-            stop_btn,             # 13  ← interactive= toggled
-            analyze_btn,          # 14  ← interactive= toggled
+            continue_btn,         # 11
+            new_topic_btn,        # 12
+            stop_btn,             # 13
+            analyze_btn,          # 14
         ]
 
-        # STOP_OUTPUTS: only stop_session writes to these.
         STOP_OUTPUTS = [
             continue_btn,         # 0
             new_topic_btn,        # 1
@@ -509,7 +544,6 @@ def create_interface():
             lang_summary_out,     # 4
         ]
 
-        # CLEAR_OUTPUTS: reset_session and continue_session also clear summary boxes.
         CLEAR_OUTPUTS = ALL_OUTPUTS + [debate_summary_out, lang_summary_out]
 
         analyze_btn.click(

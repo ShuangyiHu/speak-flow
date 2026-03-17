@@ -601,6 +601,169 @@ ACCEPTANCE CRITERIA
 - ChromaDB collection persists across process restarts (persistent client)
 """,
     },
+    "pronunciation_coach": {
+        "module_name": "pronunciation_coach.py",
+        "class_name": "PronunciationCoach",
+        "requirements": """
+PronunciationCoach generates actionable pronunciation correction feedback
+for Chinese L2 English learners, based on PronunciationResult from TurnAnalysis.
+
+────────────────────────────────────────────────────────────────────────
+CRITICAL: IMPORT AND TYPE RULES (violations will cause runtime errors)
+────────────────────────────────────────────────────────────────────────
+- MUST import all types from shared_types: WordError, PronunciationResult, ErrorSeverity
+- MUST import CoachingStrategy from shared_types
+- NEVER redefine WordError, PronunciationResult, ErrorSeverity, or CoachingStrategy locally
+- NEVER import from turn_analyzer, coach_policy, or response_generator directly
+- Access PronunciationResult fields as: result.mispronounced_words, result.fluency_score
+
+────────────────────────────────────────────────────────────────────────
+CRITICAL: FILE HEADER (copy these two lines verbatim, after all imports)
+────────────────────────────────────────────────────────────────────────
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
+
+────────────────────────────────────────────────────────────────────────
+CRITICAL: LLM CALL RULES (previous modules had bugs here)
+────────────────────────────────────────────────────────────────────────
+- Model: os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+- AsyncAnthropic client MUST set timeout at init: AsyncAnthropic(timeout=30.0)
+- Do NOT pass timeout inside messages.create() — that causes TypeError
+- Strip markdown fences BEFORE json.loads():
+    text = re.sub(r"```[a-z]*\\n?|```", "", text).strip()
+- Always wrap LLM calls in try/except; return fallback on any exception
+
+────────────────────────────────────────────────────────────────────────
+RESPONSIBILITIES
+────────────────────────────────────────────────────────────────────────
+- Accept PronunciationResult from TurnAnalysis as primary input
+- Generate a human-readable, encouraging correction message for each WordError
+- Produce a single "drill sentence" containing the target phoneme(s) for practice
+- Return a PronunciationFeedback dataclass (defined in THIS module only — not in shared_types)
+- Total latency must be under 3 seconds; use asyncio.timeout(2.8)
+
+────────────────────────────────────────────────────────────────────────
+DATA MODELS (define in this module — NOT in shared_types)
+────────────────────────────────────────────────────────────────────────
+@dataclass
+class WordCorrection:
+    word: str                   # The mispronounced word
+    error_description: str      # Human-readable description of the error
+    correction_tip: str         # Specific tip for Chinese L2 speakers (e.g. "Chinese has no /θ/ sound...")
+    model_sentence: str         # A short example sentence using this word correctly
+    severity: ErrorSeverity     # Passed through from WordError
+
+@dataclass
+class PronunciationFeedback:
+    corrections: List[WordCorrection]   # One per WordError, max 3 (highest severity first)
+    drill_sentence: str                  # A sentence containing all target phonemes for practice
+    fluency_comment: str                 # One sentence comment on fluency_score
+    overall_message: str                 # Encouraging 1-sentence summary (always positive framing)
+    has_errors: bool                     # True if corrections is non-empty
+    latency_ms: int
+
+────────────────────────────────────────────────────────────────────────
+PUBLIC INTERFACE
+────────────────────────────────────────────────────────────────────────
+class PronunciationCoach:
+    def __init__(self, anthropic_api_key: str):
+        # Store api_key. Init AsyncAnthropic(api_key=api_key, timeout=30.0).
+
+    async def generate_feedback(
+        self,
+        pronunciation_result: PronunciationResult,
+        transcript: str,
+        topic: str,
+    ) -> PronunciationFeedback:
+        # Main entry point.
+        # Step 1: If pronunciation_result.mispronounced_words is empty,
+        #   return PronunciationFeedback with corrections=[], has_errors=False,
+        #   drill_sentence="", fluency_comment based on fluency_score,
+        #   overall_message="Your pronunciation was clear this turn. Keep it up!"
+        # Step 2: Filter to top 3 errors by severity (HIGH > MEDIUM > LOW)
+        # Step 3: Call _generate_corrections() to get WordCorrection list
+        # Step 4: Call _generate_drill_sentence() to get drill sentence
+        # Step 5: Build fluency_comment: if fluency_score >= 0.7 → positive,
+        #   else → "Try to speak a bit more smoothly — aim for fewer pauses."
+        # Step 6: Return PronunciationFeedback
+
+    async def _generate_corrections(
+        self,
+        errors: List[WordError],
+        transcript: str,
+    ) -> List[WordCorrection]:
+        # For each WordError, call Claude to generate error_description + correction_tip + model_sentence.
+        # Run all calls concurrently via asyncio.gather().
+        # Prompt must include: word, expected_ipa, actual_ipa, the fact that learner is Chinese L2 speaker.
+        # Claude response must be JSON with keys: error_description, correction_tip, model_sentence
+        # Strip markdown fences before json.loads().
+        # On any exception for a word, use fallback WordCorrection with generic tip.
+
+    async def _generate_single_correction(self, error: WordError, transcript: str) -> WordCorrection:
+        # Call Claude for one WordError. Return WordCorrection.
+        # Prompt template (fill in fields):
+        #   "A Chinese learner of English mispronounced the word '{word}'.
+        #    Expected IPA: {expected_ipa}. Detected IPA: {actual_ipa}.
+        #    The word appeared in this sentence: '{transcript}'.
+        #    Respond ONLY with valid JSON (no markdown fences) with keys:
+        #    error_description (1 sentence explaining what went wrong),
+        #    correction_tip (1-2 sentences specific to Chinese speakers, e.g. mouth position),
+        #    model_sentence (short sentence 6-10 words using this word correctly)"
+        # Parse response with: re.sub(r"```[a-z]*\\n?|```", "", raw).strip() then json.loads()
+        # On exception: return WordCorrection with word=error.word, error_description="Pronunciation needs attention",
+        #   correction_tip="Practice this word slowly and listen to native speaker recordings.",
+        #   model_sentence=f"Please practice saying '{error.word}' carefully.",
+        #   severity=error.severity
+
+    async def _generate_drill_sentence(self, errors: List[WordError], topic: str) -> str:
+        # Call Claude to generate one drill sentence (10-15 words) related to topic
+        # that naturally contains the target phonemes from errors[].expected_ipa.
+        # If errors is empty, return "".
+        # Prompt: "Create a single English sentence (10-15 words) about the topic '{topic}'
+        #   that naturally contains words with these sounds: {phoneme_list}.
+        #   Return ONLY the sentence, no explanation."
+        # On exception: return a fallback sentence using the first error word.
+
+────────────────────────────────────────────────────────────────────────
+CHINESE L2 SPEAKER PHONEME PRIORITY TABLE
+(must be embedded as a dict constant in the module for prompt injection)
+────────────────────────────────────────────────────────────────────────
+CHINESE_L2_PRIORITY_PHONEMES = {
+    "/θ/": "Chinese has no /θ/ sound. Tip: place tongue between teeth.",
+    "/ð/": "The voiced /ð/ (as in 'the') has no equivalent in Mandarin.",
+    "/v/": "Mandarin speakers often substitute /w/ for /v/.",
+    "/r/": "English /r/ is retroflex; do not substitute Mandarin /r/ (closer to /ʒ/).",
+    "/l/": "Final /l/ is often dropped by Mandarin speakers — keep the tongue up.",
+    "/æ/": "The /æ/ vowel (as in 'cat') is often raised to /ɛ/ by Chinese speakers.",
+    "/ŋ/": "Final /-ng/ is often denasalized — keep the back of tongue raised.",
+}
+
+────────────────────────────────────────────────────────────────────────
+ACCEPTANCE CRITERIA
+────────────────────────────────────────────────────────────────────────
+- generate_feedback() returns PronunciationFeedback within 3 seconds
+- When mispronounced_words is empty: returns has_errors=False, corrections=[], no LLM call needed
+- When mispronounced_words has 5 items: returns at most 3 corrections (top severity)
+- Each WordCorrection.correction_tip must be non-empty string (never None)
+- drill_sentence is non-empty when errors list is non-empty
+- No exception propagates from generate_feedback() — always returns PronunciationFeedback
+- _generate_corrections() runs concurrently (asyncio.gather), not sequentially
+- Fallback WordCorrection returned on LLM timeout or API error (no crash)
+- Module imports cleanly: python -c "from pronunciation_coach import PronunciationCoach"
+
+────────────────────────────────────────────────────────────────────────
+TEST FILE: tests/test_pronunciation_coach.py
+────────────────────────────────────────────────────────────────────────
+Write pytest tests covering:
+1. generate_feedback() with empty mispronounced_words → has_errors=False, no LLM call
+2. generate_feedback() with 5 WordErrors → len(corrections) == 3
+3. generate_feedback() returns within 3 seconds (use anyio or asyncio.timeout in test)
+4. corrections list sorted by severity (HIGH before MEDIUM before LOW)
+5. drill_sentence is non-empty when errors non-empty
+6. Module import test: from pronunciation_coach import PronunciationCoach, PronunciationFeedback, WordCorrection
+Use pytest-asyncio. Mock the Anthropic API calls with unittest.mock.AsyncMock.
+""",
+    },
     
 }
 

@@ -95,9 +95,9 @@ class TestGenerateResponseHappyPath:
         generator = ResponseGenerator()
         generator._client = mock_anthropic_client
         
-        start_time = asyncio.get_event_loop().time()
+        start_time = asyncio.().time()
         await generator.generate_response(sample_request)
-        end_time = asyncio.get_event_loop().time()
+        end_time = asyncio.().time()
         
         assert end_time - start_time < MAX_RESPONSE_TIME_SECONDS
     

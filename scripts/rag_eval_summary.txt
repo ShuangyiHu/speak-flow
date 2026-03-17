@@ -1,0 +1,18 @@
+SpeakFlow RAG Evaluation Summary
+Model: claude-sonnet-4-5 | Date: 2026-03-16
+
+Cases evaluated: 15
+Baseline avg score: 12.73/15
+RAG avg score:      12.80/15
+Mean improvement:   +0.07 (+0.4%)
+Cases improved:     40%
+
+Per-dimension:
+  relevance: 4.73 → 4.93 (delta +0.20)
+  specificity: 3.73 → 3.47 (delta -0.27)
+  actionability: 4.27 → 4.40 (delta +0.13)
+
+By quality level:
+  weak: 12.80 → 12.20 (delta -0.60)
+  medium: 12.40 → 12.60 (delta +0.20)
+  strong: 13.00 → 13.60 (delta +0.60)

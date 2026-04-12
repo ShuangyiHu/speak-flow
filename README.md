@@ -1,11 +1,6 @@
-# SpeakFlow AI
+# SpeakFlow AI — Real-Time Adaptive Debate Coach
 
-> An AI-powered English debate coaching platform for Chinese L2 learners —  
-> built by a multi-agent development team.
-
-SpeakFlow AI helps students who can write English but struggle to speak it. Through structured debate practice, it builds logical thinking, spoken fluency, and pronunciation confidence — skills that Chinese curricula rarely develop.
-
-What makes this project unusual: **the platform was built by an AI agent team**. A CrewAI-powered development crew (architect, backend engineer, code reviewer, test engineer, frontend engineer) designed, implemented, reviewed, and shipped each module via automated GitHub PRs.
+An AI-powered English debate coaching app for Chinese L2 learners. Students speak; the coach listens, scores, and responds — adapting in real time to argument quality, pronunciation, and session history.
 
 ---
 
@@ -23,7 +18,7 @@ SpeakFlow addresses all three through a single interaction: a real-time AI debat
 
 ## Architecture
 
-The project has two distinct layers:
+The project has three distinct layers:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -31,13 +26,22 @@ The project has two distinct layers:
 │                                                                 │
 │  User Audio                                                     │
 │      → Whisper (transcription)                                  │
-│      → LangGraph Pipeline (pipeline.py)                         │
+│      → LangGraph Pipeline (pipeline.py)  ← planner/router only │
 │           intent_node                                           │
 │           ├── fan-out: score_node ‖ summary_node ‖ pronun_node  │
 │           ├── merge_analysis_node                               │
 │           ├── fan-out: coach_policy_node ‖ rag_node             │
 │           ├── response_node                                     │
 │           └── update_session_node → MemorySaver                 │
+│                    │  each node calls tools via MCP client      │
+│      → MCP Tool Layer (mcp_tools.py)  ← standardized interface │
+│           tool: analyze_argument_scores                         │
+│           tool: analyze_argument_summary                        │
+│           tool: analyze_pronunciation                           │
+│           tool: retrieve_evidence                               │
+│           tool: generate_response                               │
+│                    │  handlers delegate to src/ modules         │
+│      → src/ modules (turn_analyzer, rag_retriever, …)          │
 │      → Gradio UI  (app.py)                                      │
 └─────────────────────────────────────────────────────────────────┘
            ↑ each module built by the layer below
@@ -64,6 +68,7 @@ The project has two distinct layers:
 | Product  | Argument analysis      | Claude claude-sonnet-4-5 (Anthropic SDK)  |
 | Product  | Pronunciation analysis | Montreal Forced Aligner (MFA) — stub mode |
 | Product  | Agent orchestration    | LangGraph StateGraph + MemorySaver        |
+| Product  | Tool abstraction       | MCP (Model Context Protocol) — in-process |
 | Product  | RAG retrieval          | ChromaDB + sentence-transformers (HyDE)   |
 | Product  | API server             | FastAPI + WebSocket (planned)             |
 | Product  | Frontend prototype     | Gradio                                    |
@@ -75,7 +80,7 @@ The project has two distinct layers:
 
 ## LangGraph Pipeline
 
-`pipeline.py` is the orchestration core. It replaces the manual `asyncio.gather` chains from v8 with a typed `StateGraph` that makes parallelism, routing, and state management explicit.
+`pipeline.py` is the orchestration core. It replaces the manual `asyncio.gather` chains from earlier versions with a typed `StateGraph` that makes parallelism, routing, and state management explicit.
 
 ```
 START
@@ -84,14 +89,14 @@ START
        ├─ OFF_TOPIC     → off_topic_node    → END
        └─ DEBATE_STATEMENT
             └─ fan-out (Send API — true parallelism):
-                 ├─ score_node         (Claude: 4 scores + bool flags, ~1.5s)
-                 ├─ summary_node       (Claude: feedback text + summary, ~2s)
-                 └─ pronunciation_node (MFA stub → fluency score)
-            └─ merge_analysis_node  (assembles TurnAnalysis)
+                 ├─ score_node         (→ MCP: analyze_argument_scores,  ~1.5s)
+                 ├─ summary_node       (→ MCP: analyze_argument_summary, ~2s)
+                 └─ pronunciation_node (→ MCP: analyze_pronunciation)
+            └─ merge_analysis_node  (assembles TurnAnalysis — no API)
             └─ fan-out (parallel):
                  ├─ coach_policy_node  (rule-based, no API)
-                 └─ rag_node           (HyDE + ChromaDB)
-            └─ response_node       (Claude: coach text + improved + tips, 3 parallel calls)
+                 └─ rag_node           (→ MCP: retrieve_evidence)
+            └─ response_node       (→ MCP: generate_response)
             └─ update_session_node (appends to MemorySaver checkpoint)
             └─ END
 ```
@@ -99,8 +104,37 @@ START
 **Key design decisions:**
 
 - `score_node` and `summary_node` split the original single `_analyze_argument()` Claude call. `CoachPolicyAgent` only needs scores to decide strategy, so it can start as soon as `score_node` completes (~1.5s) without waiting for feedback text (~2s). Net saving: ~1.5–2s per turn.
-- All session state (`prior_turns`, `coaching_history`, `argument_scores`, etc.) lives in `SpeakFlowState` and is persisted by `MemorySaver`, keyed by `thread_id`. `app.py` holds no session state of its own.
+- All session state (`prior_turns`, `coaching_history`, `argument_scores`, etc.) lives in `SpeakFlowState` and is persisted by `MemorySaver`, keyed by `thread_id`.
 - `reset_session()` rotates to a new `thread_id` (UUID-based) for a clean slate.
+
+---
+
+## MCP Tool Layer
+
+`mcp_tools.py` introduces an in-process [Model Context Protocol](https://modelcontextprotocol.io/) tool server that standardizes all tool access behind typed schemas.
+
+### Why MCP?
+
+Before this layer, `pipeline.py` nodes directly imported and called `src/` modules. This created **code-level coupling**: changing a tool's implementation required auditing the pipeline. After the refactor:
+
+- Each pipeline node calls `await self._mcp.call_tool(name, args)` only
+- Each tool has a declared **JSON Schema** (`input_schema`) — the contract between planner and executor
+- `src/` modules are never imported by `pipeline.py` directly
+- **Swapping a tool implementation** (e.g. replacing Whisper with a different ASR) requires changes only inside `mcp_tools.py`, not in `pipeline.py`
+
+### Transport choice
+
+The MCP server runs **in-process** (no network hop). This preserves the existing latency profile — adding a network transport would add ~5–20ms of serialization overhead per tool call, multiplied across 3 parallel fan-out calls. The `SpeakFlowMCPServer` / `SpeakFlowMCPClient` classes mirror the MCP spec interface, so switching to stdio or SSE transport later requires only a transport swap, not an interface change.
+
+### Tool registry
+
+| Tool name                  | Replaces (before refactor)                         |
+| -------------------------- | -------------------------------------------------- |
+| `analyze_argument_scores`  | `pipeline._score_node` → `turn_analyzer` (direct) |
+| `analyze_argument_summary` | `pipeline._summary_node` → `turn_analyzer` (direct)|
+| `analyze_pronunciation`    | `pipeline._pronunciation_node` → `turn_analyzer`  |
+| `retrieve_evidence`        | `pipeline._rag_node` → `rag_retriever` (direct)   |
+| `generate_response`        | `pipeline._response_node` → `response_gen` (direct)|
 
 ---
 
@@ -111,7 +145,8 @@ speakflow/
 │
 ├── app/
 │   ├── app.py              # Gradio UI — session lifecycle only
-│   └── pipeline.py         # LangGraph StateGraph — all per-turn orchestration
+│   ├── pipeline.py         # LangGraph StateGraph — planner/router; calls tools via MCP
+│   └── mcp_tools.py        # MCP tool server — 5 tools, typed schemas, src/ handlers
 │
 ├── src/                    # Product modules — generated by Dev Team
 │   ├── shared_types.py     # Single source of truth for all dataclasses/enums
@@ -204,18 +239,19 @@ python main.py --module turn_analyzer
 
 ## Project Status
 
-| Component                | Status      | Notes                                     |
-| ------------------------ | ----------- | ----------------------------------------- |
-| `turn_analyzer.py`       | ✅ Complete | 4-dimension scoring, MFA stub             |
-| `coach_policy.py`        | ✅ Complete | Rule-based strategy selection             |
-| `response_generator.py`  | ✅ Complete | Coach text, improved version, tips        |
-| `rag_retriever.py`       | ✅ Complete | HyDE + ChromaDB, fallback stubs           |
-| `shared_types.py`        | ✅ Complete | Single source of truth                    |
-| `pipeline.py`            | ✅ Complete | LangGraph StateGraph, score/summary split |
-| `app.py`                 | ✅ Complete | Gradio UI, pipeline-integrated            |
-| MFA integration          | 🔄 Stub     | USE_STUB_MFA=True; real MFA planned       |
-| React + FastAPI frontend | ⏳ Planned  | Replace Gradio for production             |
-| `session_evaluator.py`   | ⏳ Planned  | Multi-round trend analysis                |
+| Component                | Status      | Notes                                          |
+| ------------------------ | ----------- | ---------------------------------------------- |
+| `turn_analyzer.py`       | ✅ Complete | 4-dimension scoring, MFA stub                  |
+| `coach_policy.py`        | ✅ Complete | Rule-based strategy selection                  |
+| `response_generator.py`  | ✅ Complete | Coach text, improved version, tips             |
+| `rag_retriever.py`       | ✅ Complete | HyDE + ChromaDB, fallback stubs                |
+| `shared_types.py`        | ✅ Complete | Single source of truth                         |
+| `pipeline.py`            | ✅ Complete | LangGraph StateGraph; calls tools via MCP      |
+| `mcp_tools.py`           | ✅ Complete | MCP tool server; 5 tools with typed schemas    |
+| `app.py`                 | ✅ Complete | Gradio UI, pipeline-integrated                 |
+| MFA integration          | 🔄 Stub     | USE_STUB_MFA=True; real MFA planned            |
+| React + FastAPI frontend | ⏳ Planned  | Replace Gradio for production                  |
+| `session_evaluator.py`   | ⏳ Planned  | Multi-round trend analysis                     |
 
 ---
 
@@ -223,7 +259,7 @@ python main.py --module turn_analyzer
 
 This project demonstrates two things on a single portfolio:
 
-1. **AI product development** — designing a real-time coaching pipeline with a LangGraph multi-agent system, RAG retrieval, audio processing, and structured feedback
+1. **AI product development** — designing a real-time coaching pipeline with LangGraph orchestration, MCP tool abstraction, RAG retrieval, audio processing, and structured feedback
 2. **AI-driven development** — using a CrewAI agent team to build the product itself, with traceable GitHub PR history for every module
 
 The target users are Chinese high school students preparing for _gaokao_ English speaking exams and beyond — students who have ideas but have never been given the space to argue in English.

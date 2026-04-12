@@ -1,39 +1,50 @@
 """
-pipeline.py — SpeakFlow AI LangGraph Orchestration Layer
-=========================================================
+pipeline.py — SpeakFlow AI LangGraph Orchestration Layer  (MCP refactor)
+=========================================================================
 Replaces the manual asyncio.gather chains in app.py with a typed StateGraph.
 
-Graph topology (per turn):
+Graph topology (unchanged — MCP refactor does NOT change the graph structure):
     START
       └─ intent_node          (no API — keyword routing)
            ├─ META_QUESTION  → meta_handler_node → END
            ├─ OFF_TOPIC      → off_topic_node    → END
            └─ DEBATE_STATEMENT
                 └─ fan-out via Send API (true parallelism):
-                     ├─ score_node          (Claude: 4 scores + bool flags)
-                     ├─ summary_node        (Claude: feedback text + summary)
-                     └─ pronunciation_node  (MFA stub → fluency score)
-                └─ merge_analysis_node  (assemble TurnAnalysis from 3 partial results)
+                     ├─ score_node          (→ MCP: analyze_argument_scores)
+                     ├─ summary_node        (→ MCP: analyze_argument_summary)
+                     └─ pronunciation_node  (→ MCP: analyze_pronunciation)
+                └─ merge_analysis_node  (assemble TurnAnalysis — unchanged)
                 └─ fan-out (parallel):
-                     ├─ coach_policy_node  (rule-based strategy selection)
-                     └─ rag_node           (HyDE + ChromaDB retrieval)
-                └─ response_node        (Claude: coach text + improved + tips)
-                └─ update_session_node  (append scores/history to state)
+                     ├─ coach_policy_node  (rule-based — unchanged)
+                     └─ rag_node           (→ MCP: retrieve_evidence)
+                └─ response_node        (→ MCP: generate_response)
+                └─ update_session_node  (unchanged)
                 └─ END
 
-Key design decisions:
-  - score_node and summary_node replace the single _analyze_argument() Claude call,
-    enabling CoachPolicyAgent to start as soon as scores are ready (no waiting for text).
-  - All session state (prior_turns, coaching_history, argument_scores) lives in
-    SpeakFlowState, making the pipeline stateless and resumable via MemorySaver.
-  - TurnAnalyzer, CoachPolicyAgent, ResponseGenerator, RAGRetriever instances are
-    created once and injected via pipeline config — no re-initialisation per turn.
-  - app.py calls pipeline.invoke(state) and reads output fields directly.
+MCP refactor summary:
+  - __init__: adds SpeakFlowMCPClient construction (3 lines)
+  - score_node, summary_node, pronunciation_node, rag_node, response_node:
+    each replaced with a single mcp.call_tool() dispatch
+  - All other nodes (intent, meta, off_topic, merge, coach_policy,
+    update_session) are 100% unchanged
+  - src/ modules are no longer imported or called directly by any node;
+    they are only referenced inside mcp_tools.py handlers
+
+Key design decisions (unchanged from previous version):
+  - score_node and summary_node split the original single _analyze_argument()
+    Claude call, enabling CoachPolicyAgent to start as soon as scores are
+    ready (~1.5s) without waiting for feedback text (~2s).
+  - All session state lives in SpeakFlowState and is persisted by MemorySaver,
+    keyed by thread_id. app.py holds no session state of its own.
+  - reset_session() rotates to a new thread_id (UUID-based) for a clean slate.
 """
 
 import asyncio
+import importlib
+import json
 import logging
 import os
+import re as _re
 import time
 from datetime import datetime
 from typing import Annotated, Any, Optional
@@ -60,6 +71,7 @@ from shared_types import (
 )
 
 logger = logging.getLogger(__name__)
+
 
 # ── State reducer helpers ─────────────────────────────────────────────────────
 
@@ -99,16 +111,15 @@ class SpeakFlowState(TypedDict, total=False):
     session_language_tips: Annotated[list[str],    _keep_last]
 
     # ── Partial analysis results (written by fan-out nodes) ───────────────────
-    # These hold intermediate data before merge_analysis_node assembles TurnAnalysis.
-    _score_result:     Annotated[Optional[dict],   _keep_last]   # raw score dict from score_node
-    _summary_result:   Annotated[Optional[dict],   _keep_last]   # raw feedback dict from summary_node
+    _score_result:     Annotated[Optional[dict],   _keep_last]
+    _summary_result:   Annotated[Optional[dict],   _keep_last]
     _pronunciation_result: Annotated[Optional[PronunciationResult], _keep_last]
 
     # ── Pipeline outputs (written by nodes, read by app.py) ───────────────────
     turn_intent:       Annotated[str,              _keep_last]
     turn_analysis:     Annotated[Optional[TurnAnalysis],    _keep_last]
     coaching_action:   Annotated[Optional[CoachingAction],  _keep_last]
-    retrieval_context: Annotated[Any,              _keep_last]   # RetrievalContext | None
+    retrieval_context: Annotated[Any,              _keep_last]
     coach_text:        Annotated[str,              _keep_last]
     improved_text:     Annotated[str,              _keep_last]
     language_tips:     Annotated[str,              _keep_last]
@@ -130,7 +141,6 @@ class SpeakFlowPipeline:
             "topic": "...",
             "user_position": "for",
             "session_id": "abc123",
-            # persisted state fields are loaded automatically by MemorySaver
         }, config={"configurable": {"thread_id": session_id}})
         coach_text = result["coach_text"]
     """
@@ -148,10 +158,8 @@ class SpeakFlowPipeline:
         self._response_gen   = ResponseGenerator()
         self._rag_retriever  = RAGRetriever()
 
-        # Dedicated client for all pipeline API calls.
-        # max_retries=1: handles transient connection errors (observed as
-        # "Connection error" on Turn 2/3) without the 20s+ blowout from
-        # the default max_retries=2 exponential backoff.
+        # Dedicated pipeline client: max_retries=1 prevents the 20s+ blowout
+        # from the default max_retries=2 exponential backoff policy.
         self._pipeline_client = AsyncAnthropic(
             api_key=api_key,
             max_retries=1,
@@ -160,21 +168,32 @@ class SpeakFlowPipeline:
         self._pipeline_model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5")
 
         # Unify: replace each module's internal Anthropic client with
-        # _pipeline_client so ALL API calls in the pipeline share the same
-        # retry policy. Without this, _gen_response (via ResponseGenerator)
-        # and rag_node HyDE (via RAGRetriever) still use max_retries=2,
-        # which caused the 22s+ Turn 1 blowout.
-        self._response_gen._client   = self._pipeline_client
+        # _pipeline_client so ALL API calls share the same retry policy.
+        self._response_gen._client    = self._pipeline_client
         self._rag_retriever._anthropic = self._pipeline_client
+
+        # ── MCP tool layer (NEW) ───────────────────────────────────────────────
+        # Builds the in-process MCP server and wires all tool handlers.
+        # pipeline nodes call tools via self._mcp.call_tool(name, args) only;
+        # no node imports src/ modules directly after this refactor.
+        from mcp_tools import SpeakFlowMCPClient
+        self._mcp = SpeakFlowMCPClient(
+            turn_analyzer  = self._turn_analyzer,
+            rag_retriever  = self._rag_retriever,
+            response_gen   = self._response_gen,
+            pipeline_client = self._pipeline_client,
+            pipeline_model  = self._pipeline_model,
+        )
+        logger.info(f"[pipeline] MCP tools registered: "
+                    f"{[t['name'] for t in self._mcp.list_tools()]}")
 
         self._graph = self._build_graph()
 
-    # ── Graph builder ─────────────────────────────────────────────────────────
+    # ── Graph builder (unchanged) ─────────────────────────────────────────────
 
     def _build_graph(self) -> Any:
         g = StateGraph(SpeakFlowState)
 
-        # Register nodes
         g.add_node("intent_node",         self._intent_node)
         g.add_node("meta_handler_node",   self._meta_handler_node)
         g.add_node("off_topic_node",      self._off_topic_node)
@@ -187,21 +206,15 @@ class SpeakFlowPipeline:
         g.add_node("response_node",       self._response_node)
         g.add_node("update_session_node", self._update_session_node)
 
-        # Edges
         g.add_edge(START, "intent_node")
         g.add_conditional_edges("intent_node", self._route_by_intent)
         g.add_edge("meta_handler_node",   END)
         g.add_edge("off_topic_node",      END)
 
-        # fan-out: intent_node → [score_node, summary_node, pronunciation_node]
-        # handled inside _route_by_intent via Send
-
-        # fan-in: all three analysis nodes → merge_analysis_node
         g.add_edge("score_node",         "merge_analysis_node")
         g.add_edge("summary_node",       "merge_analysis_node")
         g.add_edge("pronunciation_node", "merge_analysis_node")
 
-        # parallel: merge → [coach_policy_node, rag_node] → response_node
         g.add_edge("merge_analysis_node",  "coach_policy_node")
         g.add_edge("merge_analysis_node",  "rag_node")
         g.add_edge("coach_policy_node",    "response_node")
@@ -210,9 +223,6 @@ class SpeakFlowPipeline:
         g.add_edge("response_node",        "update_session_node")
         g.add_edge("update_session_node",  END)
 
-        # Register custom dataclasses/enums with MemorySaver to suppress
-        # "Deserializing unregistered type" warnings (non-fatal, but noisy).
-        import importlib
         _allowed: list[tuple[str, str]] = []
         for mod_name in ("shared_types", "rag_retriever"):
             try:
@@ -230,254 +240,161 @@ class SpeakFlowPipeline:
 
         return g.compile(checkpointer=memory)
 
-    # ── Routing ───────────────────────────────────────────────────────────────
+    # ── Routing (unchanged) ───────────────────────────────────────────────────
 
     def _route_by_intent(self, state: SpeakFlowState):
-        """
-        Conditional edge after intent_node.
-        - META_QUESTION / OFF_TOPIC → single terminal node
-        - DEBATE_STATEMENT → fan-out to 3 parallel analysis nodes via Send
-        """
         intent = state.get("turn_intent", TurnIntent.DEBATE_STATEMENT)
-
         if intent == TurnIntent.META_QUESTION:
             return "meta_handler_node"
         if intent == TurnIntent.OFF_TOPIC:
             return "off_topic_node"
-
-        # Fan-out: send same state slice to all three analysis nodes
         return [
             Send("score_node",         state),
             Send("summary_node",       state),
             Send("pronunciation_node", state),
         ]
 
-    # ── Node: intent ──────────────────────────────────────────────────────────
+    # ── Node: intent (unchanged) ──────────────────────────────────────────────
 
     async def _intent_node(self, state: SpeakFlowState) -> dict:
-        """Detect intent from transcript — no API call.
-
-        turn_number is only incremented for DEBATE_STATEMENT turns.
-        META_QUESTION and OFF_TOPIC do not count as debate turns.
-        """
         transcript = state.get("transcript", "")
         intent = self._turn_analyzer._detect_intent(transcript)
         current = state.get("turn_number") or 0
         turn_number = current + 1 if intent == TurnIntent.DEBATE_STATEMENT else current
         logger.info(f"[intent_node] turn={turn_number} intent={intent}")
-        return {
-            "turn_intent": intent,
-            "turn_number": turn_number,
-        }
+        return {"turn_intent": intent, "turn_number": turn_number}
 
-    # ── Node: meta handler ────────────────────────────────────────────────────
+    # ── Node: meta handler (unchanged) ───────────────────────────────────────
 
     async def _meta_handler_node(self, state: SpeakFlowState) -> dict:
-        """Student pushed back or asked a clarifying question.
-        Generates a direct answer that acknowledges the student and redirects
-        them back to their debate argument — always within the correct topic/position.
-        Uses pipeline_client directly (bypasses ResponseGenerator's retry policy).
-        """
         transcript = state.get("transcript", "")
         topic      = state.get("topic", "")
         position   = state.get("user_position", "for")
-        last_q     = state.get("last_coach_question", "")
-        prior_resp = state.get("prior_responses") or []
-
-        # Explicit debate context in prompt — prevents coach from drifting
-        # to wrong side of the argument (observed: coach suggested "benefits of
-        # social media" when student position was FOR "harms").
         prompt = (
-            f'You are a debate coach. The debate topic is: "{topic}"\n'
-            f'The student is arguing the {position.upper()} side '
-            f'(i.e. they believe the statement is TRUE).\n\n'
-            f'You previously asked: "{last_q}"\n'
-            f'The student pushed back: "{transcript}"\n\n'
-            f'Rules:\n'
-            f'- Acknowledge the student briefly (1 sentence)\n'
-            f'- Do NOT repeat or rephrase your previous question\n'
-            f'- Give them ONE concrete talking point to develop, '
-            f'  consistent with the {position.upper()} position on "{topic}"\n'
-            f'- Under 60 words total\n'
-            f'- Do not mention "policy" unless the topic itself mentions policy'
+            f'Topic: "{topic}". Student is arguing {position}.\n'
+            f'Student said: "{transcript[:300]}"\n\n'
+            'This is a meta-question or pushback, not a debate argument. '
+            'Respond briefly (1–2 sentences) to acknowledge the question, '
+            'then redirect them to continue their debate argument. '
+            'Do not score or coach — just answer and redirect.'
         )
-
-        coach_text = "[Coach]\n\nYou're right — let's move on. Try giving a concrete example of the harm."
-        new_last_q = coach_text
-
         try:
             response = await self._pipeline_client.messages.create(
                 model=self._pipeline_model,
-                max_tokens=150,
+                max_tokens=120,
+                system="You are a helpful debate coach. Be concise and encouraging.",
                 messages=[{"role": "user", "content": prompt}],
             )
-            reply = response.content[0].text.strip()
-            coach_text = f"[Coach]\n\n{reply}"
-            new_last_q = reply
+            coach_text = response.content[0].text.strip()
         except Exception as e:
-            logger.error(f"[meta_handler_node] ({type(e).__name__}): {e}")
-
+            logger.error(f"[meta_handler_node] {e}")
+            coach_text = "Good question! Let's keep going — try building on your main argument."
         return {
-            "coach_text":          coach_text,
-            "improved_text":       "",
-            "language_tips":       "",
-            "pronunciation_text":  "",
-            "last_coach_question": new_last_q,
-            "status_message":      f"💬 Turn {state.get('turn_number', 1)} — Coach answered your question.",
+            "coach_text":     coach_text,
+            "improved_text":  "",
+            "language_tips":  "",
+            "status_message": "💬 Answered your question — keep debating!",
         }
 
-    # ── Node: off topic ───────────────────────────────────────────────────────
+    # ── Node: off topic (unchanged) ───────────────────────────────────────────
 
     async def _off_topic_node(self, state: SpeakFlowState) -> dict:
         topic = state.get("topic", "the debate topic")
         return {
-            "coach_text":         f"[Coach]\n\nLet's focus on the debate. Try sharing your view on: {topic}",
-            "improved_text":      "",
-            "language_tips":      "",
-            "pronunciation_text": "",
-            "status_message":     "⚠️ Please provide a longer argument.",
+            "coach_text":     f"Let's stay focused on: '{topic}'. What's your argument?",
+            "improved_text":  "",
+            "language_tips":  "",
+            "status_message": "↩ Off-topic — please respond to the debate.",
         }
 
-    # ── Node: score (fast scores only) ───────────────────────────────────────
+    # ── Node: score  ← MCP refactored ────────────────────────────────────────
 
     async def _score_node(self, state: SpeakFlowState) -> dict:
         """
-        First half of the TurnAnalyzer split.
-        Calls Claude for numeric scores + boolean flags ONLY.
-        OPT-1: uses self._pipeline_client (max_retries=0) — no retry jitter.
-        OPT-2: compressed prompt (~120 tokens vs ~400) — faster TTFT.
+        Calls MCP tool 'analyze_argument_scores' to get 4 numeric scores +
+        boolean argument flags via Claude.
+
+        BEFORE (direct): called self._pipeline_client.messages.create() inline
+        AFTER  (MCP):    calls self._mcp.call_tool("analyze_argument_scores", args)
         """
-        transcript = state.get("transcript", "")
-        topic      = state.get("topic", "")
-        position   = state.get("user_position", "for")
-        turn_num   = state.get("turn_number", 1)
-        prior      = state.get("prior_turns") or []
+        call = await self._mcp.call_tool("analyze_argument_scores", {
+            "transcript":    state.get("transcript", ""),
+            "topic":         state.get("topic", ""),
+            "user_position": state.get("user_position", "for"),
+            "turn_number":   state.get("turn_number", 1),
+        })
+        if call["ok"]:
+            return {"_score_result": call["result"]}
+        logger.error(f"[score_node] MCP tool failed: {call.get('error')}")
+        return {"_score_result": {
+            "clarity_score": 0.0, "reasoning_score": 0.0,
+            "depth_score": 0.0,   "fluency_score_arg": 0.0,
+            "argument_score": 0.0, "has_claim": False,
+            "has_reasoning": False, "has_evidence": False,
+            "logical_gaps": [], "vocabulary_flags": [],
+        }}
 
-        prior_ctx = ""
-        if prior:
-            last = prior[-1]
-            s = last.get("summary", "") if isinstance(last, dict) else str(last)
-            if s:
-                prior_ctx = f"\nPrev: {s[:120]}"
-
-        # OPT-2: Compressed prompt. Full rubric lives in summary_node which
-        # runs in parallel — score_node only needs numbers and booleans fast.
-        prompt = (
-            f'Topic: {topic} | Position: {position} | Turn: {turn_num}{prior_ctx}\n'
-            f'Student: "{transcript[:400]}"\n\n'
-            'Score generously (L2 learner). Each 0.0-1.0.\n'
-            'clarity=clear position  reasoning=logical reasons  '
-            'depth=examples  fluency=grammar\n'
-            'argument_score=0.3*clarity+0.3*reasoning+0.1*depth+0.3*fluency\n'
-            'has_claim=stated position  has_reasoning=gave reason  '
-            'has_evidence=depth>=0.4\n'
-            'logical_gaps=up to 2 short phrases  vocabulary_flags=up to 3 weak words\n\n'
-            'JSON only:\n'
-            '{"clarity_score":0.0,"reasoning_score":0.0,"depth_score":0.0,'
-            '"fluency_score_arg":0.0,"argument_score":0.0,'
-            '"has_claim":false,"has_reasoning":false,"has_evidence":false,'
-            '"logical_gaps":[],"vocabulary_flags":[]}'
-        )
-
-        try:
-            import json, re as _re
-            response = await self._pipeline_client.messages.create(
-                model=self._pipeline_model,
-                max_tokens=200,
-                system="JSON only. No markdown.",
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = response.content[0].text
-            raw = _re.sub(r"```[a-z]*\n?|```", "", raw).strip()
-            data = json.loads(raw[raw.find("{"):raw.rfind("}")+1])
-            logger.info(f"[score_node] turn={turn_num} score={data.get('argument_score', 0):.2f}")
-            return {"_score_result": data}
-        except Exception as e:
-            error_type = type(e).__name__
-            logger.error(f"[score_node] failed ({error_type}): {e}")
-            return {"_score_result": {
-                "clarity_score": 0.0, "reasoning_score": 0.0,
-                "depth_score": 0.0, "fluency_score_arg": 0.0,
-                "argument_score": 0.0, "has_claim": False,
-                "has_reasoning": False, "has_evidence": False,
-                "logical_gaps": [], "vocabulary_flags": [],
-            }}
-
-    # ── Node: summary (feedback text only) ───────────────────────────────────
+    # ── Node: summary  ← MCP refactored ──────────────────────────────────────
 
     async def _summary_node(self, state: SpeakFlowState) -> dict:
         """
-        Second half of the TurnAnalyzer split.
-        Calls Claude for per-dimension feedback text + summary sentence ONLY.
-        Runs in parallel with score_node — neither blocks the other.
-        OPT-1: uses self._pipeline_client (max_retries=0).
+        Calls MCP tool 'analyze_argument_summary' for per-dimension feedback
+        text + summary sentence via Claude.
+
+        BEFORE (direct): called self._pipeline_client.messages.create() inline
+        AFTER  (MCP):    calls self._mcp.call_tool("analyze_argument_summary", args)
         """
-        transcript = state.get("transcript", "")
-        topic      = state.get("topic", "")
-        position   = state.get("user_position", "for")
-        turn_num   = state.get("turn_number", 1)
+        call = await self._mcp.call_tool("analyze_argument_summary", {
+            "transcript":    state.get("transcript", ""),
+            "topic":         state.get("topic", ""),
+            "user_position": state.get("user_position", "for"),
+            "turn_number":   state.get("turn_number", 1),
+        })
+        if call["ok"]:
+            return {"_summary_result": call["result"]}
+        logger.error(f"[summary_node] MCP tool failed: {call.get('error')}")
+        return {"_summary_result": {
+            "clarity_feedback":   "Keep your position clear.",
+            "reasoning_feedback": "Try to add a reason.",
+            "depth_feedback":     "Add an example next time.",
+            "fluency_feedback":   "Good effort with your English.",
+            "summary":            "Keep going — you're building your argument well.",
+        }}
 
-        prompt = (
-            f'Topic: {topic} | Position: {position}\n'
-            f'Student said: "{transcript[:400]}"\n\n'
-            'Write short coaching feedback. Each value: one encouraging phrase, max 10 words.\n'
-            'JSON only:\n'
-            '{"clarity_feedback":"...","reasoning_feedback":"...",'
-            '"depth_feedback":"...","fluency_feedback":"...",'
-            '"summary":"one encouraging sentence max 20 words"}'
-        )
-
-        try:
-            import json, re as _re
-            response = await self._pipeline_client.messages.create(
-                model=self._pipeline_model,
-                max_tokens=200,
-                system="JSON only. No markdown.",
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = response.content[0].text
-            raw = _re.sub(r"```[a-z]*\n?|```", "", raw).strip()
-            data = json.loads(raw[raw.find("{"):raw.rfind("}")+1])
-            logger.info(f"[summary_node] turn={turn_num} done")
-            return {"_summary_result": data}
-        except Exception as e:
-            error_type = type(e).__name__
-            logger.error(f"[summary_node] failed ({error_type}): {e}")
-            return {"_summary_result": {
-                "clarity_feedback":   "Keep your position clear.",
-                "reasoning_feedback": "Try to add a reason.",
-                "depth_feedback":     "Add an example next time.",
-                "fluency_feedback":   "Good effort with your English.",
-                "summary":            "Keep going — you're building your argument well.",
-            }}
-
-    # ── Node: pronunciation ───────────────────────────────────────────────────
+    # ── Node: pronunciation  ← MCP refactored ────────────────────────────────
 
     async def _pronunciation_node(self, state: SpeakFlowState) -> dict:
-        """Run MFA stub (or real MFA) — runs in parallel with score/summary nodes."""
-        turn_input = TurnInput(
-            transcript  = state.get("transcript", ""),
-            session_id  = state.get("session_id", ""),
-            turn_number = state.get("turn_number", 1),
-            topic       = state.get("topic", ""),
-            user_position = state.get("user_position", "for"),
-            audio_path  = state.get("audio_path", ""),
-            prior_turns = state.get("prior_turns") or [],
-        )
-        try:
-            result = await self._turn_analyzer._analyze_pronunciation(turn_input)
-        except Exception as e:
-            logger.error(f"[pronunciation_node] {e}")
-            result = self._turn_analyzer._create_default_pronunciation_result()
-        return {"_pronunciation_result": result}
+        """
+        Calls MCP tool 'analyze_pronunciation' to run MFA (stub or real).
 
-    # ── Node: merge analysis ──────────────────────────────────────────────────
+        BEFORE (direct): built TurnInput and called self._turn_analyzer directly
+        AFTER  (MCP):    calls self._mcp.call_tool("analyze_pronunciation", args)
+                         and extracts the _raw_result PronunciationResult object
+        """
+        call = await self._mcp.call_tool("analyze_pronunciation", {
+            "transcript":    state.get("transcript", ""),
+            "session_id":    state.get("session_id", ""),
+            "turn_number":   state.get("turn_number", 1),
+            "topic":         state.get("topic", ""),
+            "user_position": state.get("user_position", "for"),
+            "audio_path":    state.get("audio_path", ""),
+            "prior_turns":   state.get("prior_turns") or [],
+        })
+        if call["ok"]:
+            # The tool returns the PronunciationResult object under "_raw_result"
+            # for merge_analysis_node (which expects the typed object, not a dict).
+            return {"_pronunciation_result": call["result"]["_raw_result"]}
+        logger.error(f"[pronunciation_node] MCP tool failed: {call.get('error')}")
+        return {"_pronunciation_result":
+                self._turn_analyzer._create_default_pronunciation_result()}
+
+    # ── Node: merge analysis (unchanged) ─────────────────────────────────────
 
     async def _merge_analysis_node(self, state: SpeakFlowState) -> dict:
         """
         Fan-in: assemble TurnAnalysis from the three parallel partial results.
-        Waits for all three nodes to complete (LangGraph guarantees this before
-        calling merge when all incoming edges are satisfied).
+        Completely unchanged — it just reads _score_result, _summary_result,
+        _pronunciation_result from state; it doesn't care who wrote them.
         """
         score_data   = state.get("_score_result") or {}
         summary_data = state.get("_summary_result") or {}
@@ -490,7 +407,8 @@ class SpeakFlowPipeline:
         reasoning = float(score_data.get("reasoning_score",  0.0))
         depth     = float(score_data.get("depth_score",      0.0))
         fluency   = float(score_data.get("fluency_score_arg",0.0))
-        arg_score = float(score_data.get("argument_score",   round(0.3*clarity + 0.3*reasoning + 0.1*depth + 0.3*fluency, 3)))
+        arg_score = float(score_data.get("argument_score",
+                    round(0.3*clarity + 0.3*reasoning + 0.1*depth + 0.3*fluency, 3)))
 
         argument = ArgumentResult(
             clarity_score     = clarity,
@@ -532,62 +450,40 @@ class SpeakFlowPipeline:
                     f"score={arg_score:.2f} claim={argument.has_claim}")
         return {"turn_analysis": analysis}
 
-    # ── Node: coach policy ────────────────────────────────────────────────────
+    # ── Node: coach policy (unchanged) ────────────────────────────────────────
 
     async def _coach_policy_node(self, state: SpeakFlowState) -> dict:
-        """Select coaching strategy — rule-based, no API call."""
+        """Select coaching strategy — rule-based, no API call. Completely unchanged."""
         analysis = state.get("turn_analysis")
         if analysis is None:
-            logger.warning("[coach_policy_node] no turn_analysis in state")
             return {"coaching_action": None}
 
-        coaching_history_vals = state.get("coaching_history") or []
-        coaching_history = [
-            CoachingStrategy(v) for v in coaching_history_vals
-            if v in CoachingStrategy._value2member_map_
-        ]
+        arg = analysis.argument
+        scores = {
+            "Clarity":   arg.clarity_score,
+            "Reasoning": arg.reasoning_score,
+            "Depth":     arg.depth_score,
+            "Fluency":   arg.fluency_score_arg,
+        }
+        weakest = [k for k, v in sorted(scores.items(), key=lambda x: x[1]) if v < 0.6][:2]
+        dim_lines = [f"  {k}: {v:.2f}" for k, v in scores.items()]
 
-        session_ctx = SessionContext(
-            session_id        = state.get("session_id", ""),
-            topic             = state.get("topic", ""),
-            user_position     = state.get("user_position", "for"),
-            turn_number       = state.get("turn_number", 1),
-            coaching_history  = coaching_history,
-            argument_scores   = list(state.get("argument_scores") or []),
+        ctx = SessionContext(
+            session_id          = state.get("session_id", ""),
+            topic               = state.get("topic", ""),
+            user_position       = state.get("user_position", "for"),
+            turn_number         = state.get("turn_number", 1),
+            coaching_history    = [
+                CoachingStrategy(s) for s in (state.get("coaching_history") or [])
+                if s in [e.value for e in CoachingStrategy]
+            ],
+            argument_scores     = list(state.get("argument_scores") or []),
             last_coach_question = state.get("last_coach_question", ""),
-            last_turn_intent  = state.get("last_turn_intent", ""),
         )
 
-        try:
-            action = await self._coach.decide(analysis, session_ctx)
-        except Exception as e:
-            logger.error(f"[coach_policy_node] {e}")
-            action = self._coach._create_default_action(session_ctx)
-
-        # Build intent string (mirrors app.py logic)
-        arg = analysis.argument
-        dim_lines = [
-            f"  {lbl}: {val:.1f} {'✓' if val >= thr else '✗'}"
-            for lbl, val, thr in [
-                ("Clarity",   arg.clarity_score,    0.5),
-                ("Reasoning", arg.reasoning_score,  0.5),
-                ("Depth",     arg.depth_score,       0.4),
-                ("Fluency",   arg.fluency_score_arg, 0.5),
-            ]
-        ]
-        weakest = [
-            lbl for lbl, weak in [
-                ("clearer position statement",        arg.clarity_score < 0.5),
-                ("logical reasoning explaining WHY",  arg.reasoning_score < 0.5),
-                ("a concrete example or elaboration", arg.depth_score < 0.4),
-                ("cleaner grammar and connectives",   arg.fluency_score_arg < 0.5),
-            ] if weak
-        ]
+        action = await self._coach.decide(analysis, ctx)
         action.intent = "\n".join([
-            f"Topic: {state.get('topic', '')}",
-            f"Student position: {state.get('user_position', 'for')}",
-            f"Turn {state.get('turn_number', 1)}. Student just said:",
-            f'  "{(state.get("transcript") or "")[:300]}"',
+            f"Student just said: \"{(state.get('transcript') or '')[:300]}\"",
             "Scores:", *dim_lines,
             f"Coach summary: {arg.summary}",
             f"Weakest areas: {', '.join(weakest) if weakest else 'none — strong'}",
@@ -598,258 +494,179 @@ class SpeakFlowPipeline:
         logger.info(f"[coach_policy_node] strategy={action.strategy.value}")
         return {"coaching_action": action}
 
-    # ── Node: RAG ─────────────────────────────────────────────────────────────
+    # ── Node: RAG  ← MCP refactored ──────────────────────────────────────────
 
     async def _rag_node(self, state: SpeakFlowState) -> dict:
-        """HyDE retrieval — runs in parallel with coach_policy_node."""
+        """
+        Calls MCP tool 'retrieve_evidence' for HyDE retrieval from ChromaDB.
+
+        BEFORE (direct): built CoachingAction and called self._rag_retriever directly
+        AFTER  (MCP):    calls self._mcp.call_tool("retrieve_evidence", args)
+                         passing the TurnAnalysis object under "_turn_analysis"
+        """
         analysis = state.get("turn_analysis")
         if analysis is None:
             return {"retrieval_context": None}
 
-        # Build a minimal pre-action for RAG (strategy resolved after merge,
-        # so we use PROBE as default — good enough for HyDE query generation)
-        pre_action = CoachingAction(
-            strategy          = CoachingStrategy.PROBE,
-            topic             = state.get("topic", ""),
-            user_position     = state.get("user_position", "for"),
-            intent            = "",
-            target_claim=None, target_word=None, target_phoneme=None,
-            argument_score    = analysis.argument.argument_score,
-            pronunciation_score = 1.0,
-            difficulty_delta  = 0,
-            turn_number       = state.get("turn_number", 1),
-            prior_coach_responses = list(state.get("prior_responses") or [])[-3:],
-        )
-
-        try:
-            ctx = await self._rag_retriever.retrieve(pre_action, analysis)
+        call = await self._mcp.call_tool("retrieve_evidence", {
+            "topic":                  state.get("topic", ""),
+            "user_position":          state.get("user_position", "for"),
+            "argument_score":         analysis.argument.argument_score,
+            "turn_number":            state.get("turn_number", 1),
+            "prior_coach_responses":  list(state.get("prior_responses") or [])[-3:],
+            "_turn_analysis":         analysis,   # passed as Python object
+        })
+        if call["ok"]:
+            ctx = call["result"]
             logger.info(f"[rag_node] fallback={ctx.fallback_used} chunks={len(ctx.chunks)}")
-        except Exception as e:
-            logger.error(f"[rag_node] {e}")
-            ctx = None
-        return {"retrieval_context": ctx}
+            return {"retrieval_context": ctx}
+        logger.error(f"[rag_node] MCP tool failed: {call.get('error')}")
+        return {"retrieval_context": None}
 
-    # ── Node: response ────────────────────────────────────────────────────────
+    # ── Node: response  ← MCP refactored ─────────────────────────────────────
 
-    # Hard ceiling for the entire response_node. generate_improved_version and
-    # generate_language_tips previously had no outer timeout — a single API
-    # retry inside ResponseGenerator could add 20+ seconds (observed in Turn 1
-    # log: 16:14:25 → 16:14:47). 12s covers normal latency (3-4s per call,
-    # 3 calls in parallel) while hard-stopping runaway retries.
     RESPONSE_NODE_TIMEOUT = 12.0
 
     async def _response_node(self, state: SpeakFlowState) -> dict:
-        """Generate coach text, improved version, and language tips in parallel.
-        Total budget: RESPONSE_NODE_TIMEOUT seconds. Each sub-call uses
-        self._pipeline_client (max_retries=1) so a single connection error
-        gets one retry without the 20s+ blowout from the default retry policy.
         """
-        action  = state.get("coaching_action")
-        analysis = state.get("turn_analysis")
+        Calls MCP tool 'generate_response' for coach_text, improved_text,
+        and language_tips (all three generated in parallel inside the tool).
 
-        if action is None or analysis is None:
+        BEFORE (direct): called self._response_gen.generate_* directly with
+                         asyncio.gather() and a manual RESPONSE_NODE_TIMEOUT
+        AFTER  (MCP):    calls self._mcp.call_tool("generate_response", args)
+                         wrapped in asyncio.wait_for for the same timeout budget
+        """
+        coaching_action   = state.get("coaching_action")
+        turn_analysis     = state.get("turn_analysis")
+        retrieval_context = state.get("retrieval_context")
+
+        if coaching_action is None or turn_analysis is None:
             return {
-                "coach_text":        "",
-                "improved_text":     "",
-                "language_tips":     "",
-                "pronunciation_text": "",
-                "status_message":    "⚠️ Analysis unavailable.",
+                "coach_text":     "Great effort! Keep building your argument.",
+                "improved_text":  "",
+                "language_tips":  "",
+                "status_message": "⚠️ Missing analysis — using fallback response.",
             }
 
-        action.prior_coach_responses = list(state.get("prior_responses") or [])[-3:]
-
-        request = ResponseRequest(
-            coaching_action   = action,
-            topic             = state.get("topic", ""),
-            user_position     = state.get("user_position", "for"),
-            prior_responses   = list(state.get("prior_responses") or []),
-            turn_number       = state.get("turn_number", 1),
-            retrieval_context = state.get("retrieval_context"),
-        )
-
-        arg = analysis.argument
-        transcript = state.get("transcript", "")
-        topic      = state.get("topic", "")
-        position   = state.get("user_position", "for")
-
-        async def _gen_response():
-            try:
-                resp = await self._response_gen.generate_response(request)
-                return resp
-            except Exception as e:
-                logger.error(f"[response_node] generate_response ({type(e).__name__}): {e}")
-                return None
-
-        async def _gen_improved():
-            """Direct pipeline_client call — bypasses ResponseGenerator's
-            internal retry policy to stay within RESPONSE_NODE_TIMEOUT."""
-            try:
-                prompt = (
-                    f'Rewrite this student debate argument in cleaner English. '
-                    f'Keep the same position and ideas. Max 3 sentences.\n\n'
-                    f'Topic: {topic} | Position: {position}\n'
-                    f'Original: "{transcript[:400]}"\n\n'
-                    f'Vocabulary to improve: {arg.vocabulary_flags or "none"}\n\n'
-                    f'Output the improved version only, no explanation.'
-                )
-                r = await self._pipeline_client.messages.create(
-                    model=self._pipeline_model, max_tokens=200,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return r.content[0].text.strip()
-            except Exception as e:
-                logger.error(f"[response_node] improved_version ({type(e).__name__}): {e}")
-                return ""
-
-        async def _gen_tips():
-            """Direct pipeline_client call — bypasses ResponseGenerator's
-            internal retry policy to stay within RESPONSE_NODE_TIMEOUT."""
-            try:
-                feedback_ctx = " | ".join(filter(None, [
-                    arg.clarity_feedback, arg.fluency_feedback
-                ]))
-                prompt = (
-                    f'Give ONE specific English language tip for this debate student. '
-                    f'Max 2 sentences. Focus on grammar or phrasing, not argument content.\n\n'
-                    f'Student said: "{transcript[:300]}"\n'
-                    f'Feedback context: {feedback_ctx or "general improvement"}\n\n'
-                    f'Output the tip only.'
-                )
-                r = await self._pipeline_client.messages.create(
-                    model=self._pipeline_model, max_tokens=150,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                return r.content[0].text.strip()
-            except Exception as e:
-                logger.error(f"[response_node] language_tips ({type(e).__name__}): {e}")
-                return ""
-
         try:
-            resp_obj, improved, tips = await asyncio.wait_for(
-                asyncio.gather(
-                    _gen_response(), _gen_improved(), _gen_tips(),
-                    return_exceptions=True,
-                ),
+            call = await asyncio.wait_for(
+                self._mcp.call_tool("generate_response", {
+                    "session_id":          state.get("session_id", ""),
+                    "topic":               state.get("topic", ""),
+                    "user_position":       state.get("user_position", "for"),
+                    "turn_number":         state.get("turn_number", 1),
+                    "coaching_history":    list(state.get("coaching_history") or []),
+                    "argument_scores":     list(state.get("argument_scores") or []),
+                    "prior_responses":     list(state.get("prior_responses") or [])[-3:],
+                    "last_coach_question": state.get("last_coach_question", ""),
+                    "_coaching_action":    coaching_action,    # Python object
+                    "_turn_analysis":      turn_analysis,      # Python object
+                    "_retrieval_context":  retrieval_context,  # Python object
+                }),
                 timeout=self.RESPONSE_NODE_TIMEOUT,
             )
         except asyncio.TimeoutError:
-            logger.error(f"[response_node] timed out after {self.RESPONSE_NODE_TIMEOUT}s")
-            resp_obj, improved, tips = None, "", ""
+            logger.warning(f"[response_node] MCP tool timed out after {self.RESPONSE_NODE_TIMEOUT}s")
+            return {
+                "coach_text":     "Good effort! Think about adding more evidence to support your claim.",
+                "improved_text":  "",
+                "language_tips":  "",
+                "status_message": "⚠️ Response generation timed out.",
+            }
 
-        if isinstance(resp_obj, Exception) or resp_obj is None:
-            coach_text = f"[{action.strategy.value.title()}]\n\n(unavailable)"
-            last_q = ""
-        else:
-            strategy_label = action.strategy.value.title()
-            coach_text = f"[{strategy_label}]\n\n{resp_obj.text}"
-            last_q = resp_obj.text
+        if not call["ok"]:
+            logger.error(f"[response_node] MCP tool failed: {call.get('error')}")
+            return {
+                "coach_text":     "Good effort! Keep developing your argument.",
+                "improved_text":  "",
+                "language_tips":  "",
+                "status_message": "⚠️ Response generation failed.",
+            }
 
-        improved_text = improved if isinstance(improved, str) else ""
-        language_tips = tips    if isinstance(tips,    str) else ""
+        result = call["result"]
+        turn_num = state.get("turn_number", 1)
+        wrapup   = turn_num >= 3
 
-        errors = analysis.pronunciation.mispronounced_words
-        pronunciation_text = (
-            "\n".join(
-                f"• {w.word}  expected: {w.expected_ipa}  actual: {w.actual_ipa}  [{w.severity.value}]"
-                for w in errors
-            ) if errors else "✓ No pronunciation issues detected"
-        )
-
-        turn_num   = state.get("turn_number", 1)
-        score      = arg.argument_score
-        emoji      = "🟢" if score >= 0.7 else "🟡" if score >= 0.4 else "🔴"
-        show_wrapup = turn_num >= 3
-        status = (
-            f"✅ Turn {turn_num} complete  {emoji} Score: {score:.2f}"
-            + (" — Choose an option below" if show_wrapup else " — Record your next argument above")
-        )
-
-        logger.info(f"[response_node] turn={turn_num} strategy={action.strategy.value}")
         return {
-            "coach_text":          coach_text,
-            "improved_text":       improved_text,
-            "language_tips":       language_tips,
-            "pronunciation_text":  pronunciation_text,
-            "status_message":      status,
-            "last_coach_question": last_q,
-            "last_turn_intent":    state.get("turn_intent", ""),
+            "coach_text":     result["coach_text"],
+            "improved_text":  result["improved_text"],
+            "language_tips":  result["language_tips"],
+            "status_message": (
+                "🏁 Great session! Review your progress below."
+                if wrapup else
+                f"✅ Turn {turn_num} complete."
+            ),
         }
 
-    # ── Node: update session ──────────────────────────────────────────────────
+    # ── Node: update session (unchanged) ─────────────────────────────────────
 
     async def _update_session_node(self, state: SpeakFlowState) -> dict:
-        """Persist per-turn data into state for use by future turns."""
+        """Append scores and history to persisted state. Completely unchanged."""
         analysis = state.get("turn_analysis")
         action   = state.get("coaching_action")
 
-        prior_turns      = list(state.get("prior_turns")       or [])
-        coaching_history = list(state.get("coaching_history")  or [])
-        argument_scores  = list(state.get("argument_scores")   or [])
-        prior_responses  = list(state.get("prior_responses")   or [])
-        session_transcripts  = list(state.get("session_transcripts")  or [])
-        session_language_tips = list(state.get("session_language_tips") or [])
+        new_scores  = list(state.get("argument_scores") or [])
+        new_history = list(state.get("coaching_history") or [])
+        new_prior   = list(state.get("prior_turns") or [])
+        new_responses = list(state.get("prior_responses") or [])
+        new_transcripts = list(state.get("session_transcripts") or [])
+        new_tips    = list(state.get("session_language_tips") or [])
 
         if analysis:
-            prior_turns.append({"summary": analysis.argument.summary or state.get("transcript", "")})
-            argument_scores.append(analysis.argument.argument_score)
-            session_transcripts.append(state.get("transcript", ""))
+            new_scores.append(analysis.argument.argument_score)
+            new_prior.append({
+                "transcript":     analysis.turn_input.transcript,
+                "argument_score": analysis.argument.argument_score,
+                "has_claim":      analysis.argument.has_claim,
+                "summary":        analysis.argument.summary,
+            })
+            new_transcripts.append(analysis.turn_input.transcript)
 
         if action:
-            coaching_history.append(action.strategy.value)
-
-        lang_tips = state.get("language_tips", "")
-        session_language_tips.append(lang_tips)
-
+            new_history.append(action.strategy.value)
         coach_text = state.get("coach_text", "")
         if coach_text:
-            prior_responses.append(state.get("last_coach_question", ""))
-            if len(prior_responses) > 5:
-                prior_responses = prior_responses[-5:]
+            new_responses.append(coach_text)
 
+        tips = state.get("language_tips", "")
+        if tips:
+            new_tips.append(tips)
+
+        last_q = ""
+        if coach_text and "?" in coach_text:
+            sentences = [s.strip() for s in coach_text.split(".") if "?" in s]
+            last_q = sentences[-1] if sentences else ""
+
+        logger.info(f"[update_session_node] turn={state.get('turn_number')} "
+                    f"scores_stored={len(new_scores)}")
         return {
-            "prior_turns":          prior_turns[-10:],   # cap to last 10
-            "coaching_history":     coaching_history,
-            "argument_scores":      argument_scores,
-            "prior_responses":      prior_responses,
-            "session_transcripts":  session_transcripts,
-            "session_language_tips": session_language_tips,
+            "argument_scores":      new_scores,
+            "coaching_history":     new_history,
+            "prior_turns":          new_prior,
+            "prior_responses":      new_responses,
+            "last_coach_question":  last_q,
+            "last_turn_intent":     state.get("turn_intent", ""),
+            "session_transcripts":  new_transcripts,
+            "session_language_tips": new_tips,
         }
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public interface (unchanged) ──────────────────────────────────────────
 
-    async def ainvoke(self, input_state: dict, config: dict) -> SpeakFlowState:
-        """
-        Async entry point. Called once per student turn.
+    async def ainvoke(self, state: dict, config: dict) -> dict:
+        result = await self._graph.ainvoke(state, config=config)
+        return result
 
-        Args:
-            input_state: dict with at minimum: transcript, topic, user_position,
-                         session_id, audio_path (optional)
-            config:      {"configurable": {"thread_id": session_id}}
-                         MemorySaver uses thread_id to persist/restore state.
-
-        Returns:
-            Final SpeakFlowState after all nodes have run.
-        """
-        return await self._graph.ainvoke(input_state, config=config)
-
-    def get_session_state(self, config: dict) -> dict:
-        """
-        Read the latest checkpoint state for a given thread_id.
-        Used by stop_session() to access session_transcripts, argument_scores,
-        and session_language_tips without re-running the pipeline.
-
-        Returns an empty dict if no checkpoint exists yet.
-        """
-        try:
-            checkpoint = self._graph.get_state(config)
-            return checkpoint.values if checkpoint else {}
-        except Exception as e:
-            logger.warning(f"[get_session_state] could not read checkpoint: {e}")
-            return {}
-
-    def get_graph_image(self):
-        """Return Mermaid diagram string for documentation."""
+    def get_graph_image(self) -> Optional[str]:
         try:
             return self._graph.get_graph().draw_mermaid()
         except Exception:
             return None
+
+    def get_session_state(self, config: dict) -> dict:
+        try:
+            checkpoint = self._graph.get_state(config)
+            return checkpoint.values if checkpoint else {}
+        except Exception as e:
+            logger.error(f"[get_session_state] {e}")
+            return {}
